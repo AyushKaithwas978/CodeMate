@@ -1,71 +1,75 @@
 {
-  "name": "localcopilot",
-  "displayName": "LocalCopilot",
-  "description": "",
-  "version": "0.0.1",
-  "engines": {
-    "vscode": "^1.109.0"
-  },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [
-    "*",
-    "onView:localcopilot.agentView"
-  ],
-  "main": "./out/extension.js",
-  "contributes": {
-    "commands": [
-      {
-        "command": "localcopilot.helloWorld",
-        "title": "Hello World"
-      }
-    ],
-    "configuration": {
-      "title": "LocalCopilot",
-      "properties": {
-        "localcopilot.inlineModel": {
-          "type": "string",
-          "default": "",
-          "description": "Ollama model for inline completions. Leave empty to use the first available model."
-        }
-      }
-    },
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "localcopilot",
-          "title": "LocalCopilot",
-          "icon": "media/icon.svg"
-        }
-      ]
-    },
-    "views": {
-      "localcopilot": [
-        {
-          "id": "localcopilot.agentView",
-          "name": "LocalCopilot Agent",
-          "type": "webview"
-        }
-      ]
-    }
-  },
-  "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
-    "lint": "eslint src",
-    "test": "vscode-test"
-  },
-  "devDependencies": {
-    "@types/vscode": "^1.109.0",
-    "@types/mocha": "^10.0.10",
-    "@types/node": "22.x",
-    "typescript-eslint": "^8.54.0",
-    "eslint": "^9.39.2",
-    "typescript": "^5.9.3",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2"
-  }
+    "name":  "codemate",
+    "displayName":  "CodeMate",
+    "description":  "",
+    "version":  "0.0.1",
+    "engines":  {
+                    "vscode":  "^1.109.0"
+                },
+    "categories":  [
+                       "Other"
+                   ],
+    "activationEvents":  [
+                             "onView:localcopilot.agentView"
+                         ],
+    "main":  "./out/extension.js",
+    "contributes":  {
+                        "commands":  [
+                                         {
+                                             "command":  "localcopilot.helloWorld",
+                                             "title":  "Hello World"
+                                         }
+                                     ],
+                        "configuration":  {
+                                              "title":  "LocalCopilot",
+                                              "properties":  {
+                                                                 "localcopilot.inlineModel":  {
+                                                                                                  "type":  "string",
+                                                                                                  "default":  "",
+                                                                                                  "description":  "Ollama model for inline completions. Leave empty to use the first available model."
+                                                                                              }
+                                                             }
+                                          },
+                        "viewsContainers":  {
+                                                "activitybar":  [
+                                                                    {
+                                                                        "id":  "localcopilot",
+                                                                        "title":  "CodeMate",
+                                                                        "icon":  "media/icon.svg"
+                                                                    }
+                                                                ]
+                                            },
+                        "views":  {
+                                      "localcopilot":  [
+                                                           {
+                                                               "id":  "localcopilot.agentView",
+                                                               "name":  "CodeMate Agent",
+                                                               "type":  "webview"
+                                                           }
+                                                       ]
+                                  }
+                    },
+    "scripts":  {
+                    "vscode:prepublish":  "npm run compile",
+                    "compile":  "tsc -p ./",
+                    "watch":  "tsc -watch -p ./",
+                    "pretest":  "npm run compile \u0026\u0026 npm run lint",
+                    "lint":  "eslint src",
+                    "test":  "vscode-test"
+                },
+    "devDependencies":  {
+                            "@types/vscode":  "^1.109.0",
+                            "@types/mocha":  "^10.0.10",
+                            "@types/node":  "22.x",
+                            "typescript-eslint":  "^8.54.0",
+                            "eslint":  "^9.39.2",
+                            "typescript":  "^5.9.3",
+                            "@vscode/test-cli":  "^0.0.12",
+                            "@vscode/test-electron":  "^2.5.2"
+                        },
+    "license":  "MIT",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "https://github.com/AyushKaithwas978/CodeMate"
+                   }
 }
