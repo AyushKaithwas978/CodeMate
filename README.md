@@ -1,6 +1,6 @@
 ﻿# CodeMate
 
-CodeMate is a workspace for **LocalCopilot**, a local-first VS Code coding assistant powered by Ollama. It provides inline completions and a chat-based workflow with apply/reject code changes.
+CodeMate is a workspace for **CodeMate**, a local-first VS Code coding assistant powered by Ollama. It provides inline completions and a chat-based workflow with apply/reject code changes.
 
 ## Repository Structure
 - `localcopilot/` — the VS Code extension (TypeScript + Webview UI).
@@ -18,8 +18,23 @@ CodeMate is a workspace for **LocalCopilot**, a local-first VS Code coding assis
 2. `npm install`
 3. Open the folder in VS Code and run the extension:
    - Press `F5` to launch the Extension Development Host.
-4. Open the **LocalCopilot** view from the Activity Bar.
+4. Open the **CodeMate** view from the Activity Bar.
 5. Select a model and start using inline completions or chat.
+
+## Install (VSIX)
+1. Package the extension from `localcopilot/`:
+
+```bash
+npx @vscode/vsce package
+```
+
+2. Install the VSIX in VS Code:
+
+```bash
+code --install-extension "<path>\\codemate-<version>.vsix"
+```
+
+3. Make sure Ollama is running and at least one model is pulled (for example `ollama pull llama3.1`), then open the **CodeMate** view and select a model.
 
 ## Settings
 - `localcopilot.inlineModel` — Ollama model for inline completions. Leave empty to use the first available model.
