@@ -427,7 +427,7 @@
 		
 		const roleSpan = document.createElement('span');
 		roleSpan.className = 'message-role';
-		roleSpan.textContent = message.role === 'user' ? 'You' : 'LocalCopilot';
+		roleSpan.textContent = message.role === 'user' ? 'You' : 'CodeMate';
 		header.appendChild(roleSpan);
 
 		// Show file context
@@ -553,7 +553,7 @@
 			const applyBtn = document.createElement('button');
 			applyBtn.textContent = 'Apply';
 			applyBtn.addEventListener('click', () => {
-				console.log('[LocalCopilot] Apply clicked', { messageId, changeIndex });
+				console.log('[CodeMate] Apply clicked', { messageId, changeIndex });
 				vscode.postMessage({ 
 					type: 'applyChange', 
 					messageId, 
@@ -564,7 +564,7 @@
 			const rejectBtn = document.createElement('button');
 			rejectBtn.textContent = 'Reject';
 			rejectBtn.addEventListener('click', () => {
-				console.log('[LocalCopilot] Reject clicked', { messageId, changeIndex });
+				console.log('[CodeMate] Reject clicked', { messageId, changeIndex });
 				vscode.postMessage({ 
 					type: 'rejectChange', 
 					messageId, 

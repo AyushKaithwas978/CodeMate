@@ -34,9 +34,9 @@ interface ChatSession {
 }
 
 export function activate(context: vscode.ExtensionContext) {
-	const output = vscode.window.createOutputChannel('LocalCopilot');
+	const output = vscode.window.createOutputChannel('CodeMate');
 	context.subscriptions.push(output);
-	output.appendLine('LocalCopilot activated');
+	output.appendLine('CodeMate activated');
 
 	// Inline completion provider
 	const provider = new PythonSidecarProvider(output);
@@ -138,7 +138,7 @@ class PythonSidecarProvider implements vscode.InlineCompletionItemProvider {
 	}
 
 	private async getInlineModel(): Promise<string | null> {
-		const configured = vscode.workspace.getConfiguration('localcopilot').get<string>('inlineModel');
+		const configured = vscode.workspace.getConfiguration('codemate').get<string>('inlineModel');
 		if (configured?.trim()) return configured.trim();
 		const now = Date.now();
 		if (this.inlineModelCache && now - this.inlineModelCache.fetchedAt < this.inlineModelTtlMs) {
@@ -163,7 +163,7 @@ class PythonSidecarProvider implements vscode.InlineCompletionItemProvider {
 
 // Chat-based Sidebar Provider with improved error detection
 class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
-	public static readonly viewType = 'localcopilot.agentView';
+	public static readonly viewType = 'codemate.agentView';
 
 	private context: vscode.ExtensionContext;
 	private output: vscode.OutputChannel;
@@ -173,12 +173,129 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	private groqModel: string = '';
 	private sessions: ChatSession[] = [];
 	private currentSessionId: string | null = null;
-	private readonly sessionsStorageKey = 'localcopilot.sessions';
-	private readonly currentSessionStorageKey = 'localcopilot.currentSession';
-	private readonly currentModelStorageKey = 'localcopilot.currentModel';
+	private readonly sessionsStorageKey = 'codemate.sessions';
+	private readonly currentSessionStorageKey = 'codemate.currentSession';
+	private readonly currentModelStorageKey = 'codemate.currentModel';
+	private readonly groqModelStorageKey = 'codemate.groqModel';
 	private pendingConfirms = new Map<string, (choice: string | null) => void>();
 	private agentServiceProcess: import('child_process').ChildProcess | undefined;
 	private agentServiceStarting: Promise<boolean> | null = null;
+
+	private resolvePythonCommand(): { cmd: string; args: string[] } {
+		const configured = vscode.workspace.getConfiguration('codemate').get<string>('pythonPath');
+		const envPath = process.env.CODEMATE_PYTHON || process.env.PYTHON_PATH || process.env.PYTHON;
+		const candidate = (configured || envPath || '').trim();
+		if (candidate) {
+			const parts = candidate.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+			const cleaned = parts.map(part => part.replace(/^"(.*)"$/, '$1'));
+			if (cleaned.length > 0) {
+				const cmd = cleaned[0];
+				if (cmd.includes('\\') || cmd.includes('/')) {
+					const fs = require('fs');
+					if (fs.existsSync(cmd)) {
+						return { cmd, args: cleaned.slice(1) };
+					}
+					this.output.appendLine(`[Python] Configured pythonPath not found: ${cmd}`);
+				} else {
+					return { cmd, args: cleaned.slice(1) };
+				}
+			}
+		}
+		if (process.platform === 'win32') {
+			const pyLauncher = 'C:\\Windows\\py.exe';
+			try {
+				const fs = require('fs');
+				if (fs.existsSync(pyLauncher)) {
+					return { cmd: pyLauncher, args: ['-3'] };
+				}
+			} catch {
+				// ignore
+			}
+			return { cmd: 'py', args: ['-3'] };
+		}
+		return { cmd: 'python3', args: [] };
+	}
+	private resolveMcpServerPath(): string | null {
+		const fs = require('fs');
+		const candidates: string[] = [];
+		const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (workspaceRoot) {
+			candidates.push(path.join(workspaceRoot, 'mcp_server'));
+		}
+		candidates.push(path.join(this.context.extensionPath, 'mcp_server'));
+		candidates.push(path.resolve(this.context.extensionPath, '..', 'mcp_server'));
+
+		for (const candidate of candidates) {
+			try {
+				const serverPath = path.join(candidate, 'server.py');
+				if (fs.existsSync(serverPath)) return candidate;
+			} catch {
+				// ignore
+			}
+		}
+		return null;
+	}
+
+	private resolveMcpEnvPath(): string | null {
+		const fs = require('fs');
+		const candidates: string[] = [];
+		const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (workspaceRoot) {
+			candidates.push(path.join(workspaceRoot, 'mcp_server', '.env'));
+		}
+		candidates.push(path.join(this.context.extensionPath, 'mcp_server', '.env'));
+		candidates.push(path.resolve(this.context.extensionPath, '..', 'mcp_server', '.env'));
+
+		for (const candidate of candidates) {
+			try {
+				if (fs.existsSync(candidate)) return candidate;
+			} catch {
+				// ignore
+			}
+		}
+		return null;
+	}
+
+	private loadDotEnvVars(): Record<string, string> {
+		const envPath = this.resolveMcpEnvPath();
+		if (!envPath) return {};
+		try {
+			const fs = require('fs');
+			const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+			const vars: Record<string, string> = {};
+			for (const line of lines) {
+				const raw = line.trim();
+				if (!raw || raw.startsWith('#') || !raw.includes('=')) continue;
+				const [k, v] = raw.split('=', 2);
+				const key = k?.trim();
+				if (!key) continue;
+				vars[key] = (v ?? '').trim().replace(/^['"]|['"]$/g, '');
+			}
+			return vars;
+		} catch {
+			return {};
+		}
+	}
+
+	private resolveAgentServicePath(): string | null {
+		const fs = require('fs');
+		const candidates: string[] = [];
+		const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (workspaceRoot) {
+			candidates.push(path.join(workspaceRoot, 'agents_service.py'));
+		}
+		candidates.push(path.join(this.context.extensionPath, 'agents_service.py'));
+		candidates.push(path.resolve(this.context.extensionPath, '..', 'agents_service.py'));
+
+		for (const candidate of candidates) {
+			try {
+				if (fs.existsSync(candidate)) return candidate;
+			} catch {
+				// ignore
+			}
+		}
+		return null;
+	}
 
 	constructor(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
 		this.context = context;
@@ -229,7 +346,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 					break;
 				case 'saveGroqModel':
 					this.groqModel = String(message.model || '').trim();
-					void this.context.globalState.update('localcopilot.groqModel', this.groqModel);
+					void this.context.globalState.update(this.groqModelStorageKey, this.groqModel);
 					this.postToWebview({ type: 'groqModelSaved', model: this.groqModel });
 					break;
 				case 'testGroq':
@@ -607,8 +724,11 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		const wantsReadme = text.includes('readme');
 		const wantsCommit = text.includes('commit');
 		const wantsPush = text.includes('push') || text.includes('publish');
-		const mentionsGithub = text.includes('github') || text.includes('repo');
-		return (wantsCommit || wantsPush || wantsReadme) && mentionsGithub;
+		const wantsAdd = /\badd\b/.test(text) || text.includes('stage') || text.includes('git add');
+		const mentionsGitHost = /(github|git hub|githb|githu|githug|gitlab|bitbucket|repo|repository)/.test(text);
+		const mentionsGit = /\bgit\b/.test(text);
+		const wantsGitOps = wantsCommit || wantsPush || wantsReadme || wantsAdd;
+		return wantsGitOps && (mentionsGitHost || mentionsGit || wantsCommit || wantsPush);
 	}
 
 	private async runFileAndGitFlowFromChat(request: string, assistantMessage: ChatMessage): Promise<void> {
@@ -843,42 +963,22 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	}
 
 	private loadGroqApiKey(): string | null {
+		const configured = vscode.workspace.getConfiguration('codemate').get<string>('groqApiKey');
+		if (configured?.trim()) return configured.trim();
 		if (process.env.GROQ_API_KEY) return process.env.GROQ_API_KEY;
-		const envPath = path.resolve(this.context.extensionPath, '..', 'mcp_server', '.env');
-		try {
-			const fs = require('fs');
-			if (!fs.existsSync(envPath)) return null;
-			const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
-			for (const line of lines) {
-				const raw = line.trim();
-				if (!raw || raw.startsWith('#') || !raw.includes('=')) continue;
-				const [k, v] = raw.split('=', 2);
-				if (k.trim() === 'GROQ_API_KEY') return v.trim().replace(/^['"]|['"]$/g, '');
-			}
-		} catch {
-			return null;
-		}
+		const envVars = this.loadDotEnvVars();
+		if (envVars.GROQ_API_KEY) return envVars.GROQ_API_KEY;
 		return null;
 	}
 
+
 	private loadGithubOwnerName(): string | null {
 		if (process.env.GITHUB_OWNER_NAME) return process.env.GITHUB_OWNER_NAME;
-		const envPath = path.resolve(this.context.extensionPath, '..', 'mcp_server', '.env');
-		try {
-			const fs = require('fs');
-			if (!fs.existsSync(envPath)) return null;
-			const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
-			for (const line of lines) {
-				const raw = line.trim();
-				if (!raw || raw.startsWith('#') || !raw.includes('=')) continue;
-				const [k, v] = raw.split('=', 2);
-				if (k.trim() === 'GITHUB_OWNER_NAME') return v.trim().replace(/^['"]|['"]$/g, '');
-			}
-		} catch {
-			return null;
-		}
+		const envVars = this.loadDotEnvVars();
+		if (envVars.GITHUB_OWNER_NAME) return envVars.GITHUB_OWNER_NAME;
 		return null;
 	}
+
 
 	private async isGitRepo(repoPath: string): Promise<boolean> {
 		try {
@@ -1832,20 +1932,21 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 		this.agentServiceStarting = (async () => {
 			this.postToWebview({ type: 'agentStatus', status: 'starting' });
-			const fs = require('fs');
-			const servicePath = path.resolve(this.context.extensionPath, '..', 'agents_service.py');
-			if (!fs.existsSync(servicePath)) {
-				this.output.appendLine(`[AgentService] agents_service.py not found at ${servicePath}`);
+			const servicePath = this.resolveAgentServicePath();
+			if (!servicePath) {
+				this.output.appendLine('[AgentService] agents_service.py not found in workspace or extension.');
 				this.postToWebview({ type: 'agentStatus', status: 'error', detail: 'missing' });
 				return false;
 			}
 
 			try {
 				const { spawn } = await import('child_process');
+				const python = this.resolvePythonCommand();
 				this.output.appendLine('[AgentService] Starting agents_service.py...');
-				const proc = spawn('python', [servicePath], {
+				const proc = spawn(python.cmd, [...python.args, servicePath], {
 					cwd: path.dirname(servicePath),
 					stdio: ['ignore', 'pipe', 'pipe'],
+					env: { ...process.env, ...this.loadDotEnvVars() },
 					detached: true
 				});
 				this.agentServiceProcess = proc;
@@ -1896,12 +1997,18 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 	private async callMcpTool(toolName: string, args: Record<string, unknown>): Promise<any> {
 		const { spawn } = await import('child_process');
+		const python = this.resolvePythonCommand();
 
 		return new Promise((resolve, reject) => {
-			const mcpCwd = path.resolve(this.context.extensionPath, '..', 'mcp_server');
-			const proc = spawn('python', ['server.py'], {
+			const mcpCwd = this.resolveMcpServerPath();
+			if (!mcpCwd) {
+				this.output.appendLine('[MCP] mcp_server not found in workspace or extension.');
+				return reject(new Error('mcp_server not found'));
+			}
+			const proc = spawn(python.cmd, [...python.args, 'server.py'], {
 				cwd: mcpCwd,
-				stdio: ['pipe', 'pipe', 'pipe']
+				stdio: ['pipe', 'pipe', 'pipe'],
+				env: { ...process.env, ...this.loadDotEnvVars() }
 			});
 
 			const send = (msg: any) => {
@@ -1961,7 +2068,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 				models.push('Groq Model');
 				const savedModel = this.context.globalState.get<string>(this.currentModelStorageKey) || '';
 				this.currentModel = savedModel && models.includes(savedModel) ? savedModel : (models[0] || '');
-				this.groqModel = this.context.globalState.get<string>('localcopilot.groqModel') || '';
+				this.groqModel = this.context.globalState.get<string>(this.groqModelStorageKey) || '';
 				this.postToWebview({ type: 'modelsLoaded', models, currentModel: this.currentModel });
 				this.postToWebview({ type: 'groqModelSaved', model: this.groqModel });
 				await this.sendGroqModelsToWebview();
@@ -1994,46 +2101,76 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	<meta charset="UTF-8">
 	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource};">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>LocalCopilot</title>
+	<title>CodeMate</title>
 	<style>
 		* { margin: 0; padding: 0; box-sizing: border-box; }
 		
 		:root {
-			--bg-primary: #1e1e1e;
-			--bg-secondary: #252526;
-			--bg-tertiary: #2d2d30;
-			--border: #3e3e42;
-			--text-primary: #cccccc;
-			--text-secondary: #858585;
-			--accent: #0e639c;
-			--accent-hover: #1177bb;
-			--success: #4ec9b0;
+			--bg-primary: #0f1115;
+			--bg-secondary: #151a22;
+			--bg-tertiary: #1d2430;
+			--border: rgba(255, 255, 255, 0.08);
+			--text-primary: #f3f0ea;
+			--text-secondary: #9aa4b2;
+			--accent: #f4b860;
+			--accent-hover: #ffcf8a;
+			--accent-2: #5fb4a8;
+			--success: #7ee3b2;
 			--error: #f48771;
-			--add-bg: #1e3a1e;
-			--del-bg: #3a1e1e;
+			--add-bg: rgba(52, 120, 72, 0.2);
+			--del-bg: rgba(136, 53, 53, 0.2);
+			--shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+			--glow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 12px 30px rgba(0, 0, 0, 0.35);
 		}
 
 		body {
-			font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+			font-family: 'Space Grotesk', 'Segoe UI Variable', 'Bahnschrift', 'Trebuchet MS', sans-serif;
 			background: var(--bg-primary);
 			color: var(--text-primary);
 			display: flex;
 			height: 100vh;
 			overflow: hidden;
+			position: relative;
+			letter-spacing: 0.2px;
+		}
+
+		body::before {
+			content: '';
+			position: fixed;
+			inset: 0;
+			background:
+				radial-gradient(800px 400px at 15% -10%, rgba(244, 184, 96, 0.18), transparent 60%),
+				radial-gradient(700px 380px at 90% 10%, rgba(95, 180, 168, 0.2), transparent 60%),
+				radial-gradient(900px 520px at 50% 120%, rgba(80, 110, 160, 0.2), transparent 65%);
+			pointer-events: none;
+			z-index: 0;
+		}
+
+		body::after {
+			content: '';
+			position: fixed;
+			inset: 0;
+			background-image: linear-gradient(120deg, rgba(255, 255, 255, 0.03) 0%, transparent 35%, rgba(255, 255, 255, 0.02) 100%);
+			mix-blend-mode: screen;
+			opacity: 0.6;
+			pointer-events: none;
+			z-index: 0;
 		}
 
 		.sidebar {
 			width: 200px;
-			background: var(--bg-secondary);
+			background: linear-gradient(180deg, rgba(21, 26, 34, 0.98) 0%, rgba(15, 18, 24, 0.98) 100%);
 			border-right: 1px solid var(--border);
 			display: flex;
 			flex-direction: column;
 			flex-shrink: 0;
+			backdrop-filter: blur(6px);
 		}
 
 		.sidebar-header {
 			padding: 12px;
 			border-bottom: 1px solid var(--border);
+			background: rgba(15, 18, 24, 0.85);
 			display: flex;
 			flex-direction: column;
 			gap: 8px;
@@ -2042,17 +2179,19 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		.new-chat-btn {
 			width: 100%;
 			padding: 8px 12px;
-			background: var(--accent);
-			border: none;
+			background: linear-gradient(135deg, rgba(244, 184, 96, 0.9), rgba(255, 207, 138, 0.9));
+			border: 1px solid rgba(255, 255, 255, 0.15);
 			border-radius: 6px;
-			color: white;
+			color: #1a1a1a;
 			font-size: 12px;
 			cursor: pointer;
 			font-weight: 500;
+			box-shadow: 0 8px 18px rgba(244, 184, 96, 0.2);
 		}
 
 		.new-chat-btn:hover {
-			background: var(--accent-hover);
+			transform: translateY(-1px);
+			box-shadow: 0 10px 20px rgba(244, 184, 96, 0.3);
 		}
 
 		.clear-history-btn {
@@ -2060,16 +2199,16 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			padding: 6px 10px;
 			border: 1px solid var(--border);
 			border-radius: 6px;
-			background: transparent;
+			background: rgba(21, 26, 34, 0.5);
 			color: var(--text-secondary);
 			font-size: 11px;
 			cursor: pointer;
 		}
 
 		.clear-history-btn:hover {
-			border-color: var(--accent);
-			background: var(--bg-tertiary);
-			color: var(--text-primary);
+			border-color: rgba(255, 207, 138, 0.6);
+			background: rgba(244, 184, 96, 0.1);
+			color: var(--accent-hover);
 		}
 
 		.chats-container {
@@ -2084,15 +2223,17 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			border-radius: 6px;
 			cursor: pointer;
 			border: 1px solid transparent;
+			transition: transform 0.15s ease, border-color 0.2s ease, background 0.2s ease;
 		}
 
 		.chat-item:hover {
-			background: var(--bg-tertiary);
+			background: rgba(29, 36, 48, 0.7);
+			transform: translateX(2px);
 		}
 
 		.chat-item.active {
-			background: var(--bg-tertiary);
-			border-color: var(--accent);
+			background: rgba(95, 180, 168, 0.15);
+			border-color: rgba(95, 180, 168, 0.6);
 		}
 
 		.chat-title {
@@ -2120,12 +2261,14 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			flex: 1;
 			display: flex;
 			flex-direction: column;
+			position: relative;
+			z-index: 1;
 		}
 
 		.messages-container {
 			flex: 1;
 			overflow-y: auto;
-			padding: 16px;
+			padding: 20px 18px 28px;
 			display: flex;
 			flex-direction: column;
 			gap: 16px;
@@ -2135,6 +2278,11 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			display: flex;
 			flex-direction: column;
 			gap: 8px;
+			animation: rise 0.35s ease both;
+		}
+
+		.message:nth-child(odd) {
+			animation-delay: 0.02s;
 		}
 
 		.message-header {
@@ -2148,19 +2296,24 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		.message-role {
 			font-weight: 600;
 			color: var(--accent);
+			letter-spacing: 0.6px;
+			text-transform: uppercase;
+			font-size: 10px;
 		}
 
 		.message-content {
 			padding: 12px;
 			border-radius: 8px;
-			background: var(--bg-secondary);
-			border: 1px solid var(--border);
+			background: rgba(21, 26, 34, 0.85);
+			border: 1px solid rgba(255, 255, 255, 0.08);
+			box-shadow: var(--glow);
 			line-height: 1.6;
 			font-size: 13px;
 		}
 
 		.message.user .message-content {
-			background: var(--bg-tertiary);
+			background: linear-gradient(135deg, rgba(244, 184, 96, 0.12), rgba(95, 180, 168, 0.1));
+			border-color: rgba(244, 184, 96, 0.25);
 		}
 
 		.file-context {
@@ -2168,7 +2321,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			align-items: center;
 			gap: 6px;
 			padding: 4px 8px;
-			background: var(--bg-tertiary);
+			background: rgba(29, 36, 48, 0.8);
 			border: 1px solid var(--border);
 			border-radius: 4px;
 			font-size: 11px;
@@ -2184,8 +2337,9 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			margin: 8px 0;
 			border-radius: 6px;
 			overflow: hidden;
-			background: var(--bg-tertiary);
-			border: 1px solid var(--border);
+			background: rgba(29, 36, 48, 0.9);
+			border: 1px solid rgba(255, 255, 255, 0.08);
+			box-shadow: var(--glow);
 		}
 
 		.code-header {
@@ -2193,7 +2347,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			justify-content: space-between;
 			align-items: center;
 			padding: 8px 12px;
-			background: var(--bg-secondary);
+			background: rgba(21, 26, 34, 0.9);
 			border-bottom: 1px solid var(--border);
 			font-size: 11px;
 			color: var(--text-secondary);
@@ -2208,15 +2362,17 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			padding: 4px 8px;
 			font-size: 11px;
 			border: 1px solid var(--border);
-			background: var(--bg-tertiary);
+			background: rgba(21, 26, 34, 0.8);
 			color: var(--text-primary);
 			border-radius: 4px;
 			cursor: pointer;
+			transition: transform 0.15s ease, border-color 0.2s ease, background 0.2s ease;
 		}
 
 		.code-actions button:hover {
-			background: var(--accent);
-			border-color: var(--accent);
+			background: rgba(244, 184, 96, 0.2);
+			border-color: rgba(244, 184, 96, 0.6);
+			transform: translateY(-1px);
 		}
 
 		.code-actions button.success {
@@ -2229,7 +2385,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			margin: 0;
 			padding: 12px;
 			overflow-x: auto;
-			font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+			font-family: 'Cascadia Code', 'JetBrains Mono', 'Consolas', 'SFMono-Regular', monospace;
 			font-size: 12px;
 			line-height: 1.5;
 		}
@@ -2247,12 +2403,12 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 		.diff-line.add {
 			background: var(--add-bg);
-			color: #90ee90;
+			color: #9af0b5;
 		}
 
 		.diff-line.del {
 			background: var(--del-bg);
-			color: #ff6b6b;
+			color: #ff9a9a;
 		}
 
 		.diff-line.ctx {
@@ -2264,7 +2420,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			align-items: center;
 			gap: 8px;
 			padding: 8px 12px;
-			background: var(--bg-tertiary);
+			background: rgba(29, 36, 48, 0.8);
 			border-radius: 6px;
 			font-size: 12px;
 			color: var(--text-secondary);
@@ -2291,9 +2447,14 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			30% { opacity: 1; }
 		}
 
+		@keyframes rise {
+			from { transform: translateY(8px); opacity: 0; }
+			to { transform: translateY(0); opacity: 1; }
+		}
+
 		.input-container {
 			padding: 12px;
-			background: var(--bg-secondary);
+			background: rgba(21, 26, 34, 0.95);
 			border-top: 1px solid var(--border);
 			overflow: visible;
 		}
@@ -2308,8 +2469,8 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		.input-field {
 			flex: 1;
 			padding: 10px 12px;
-			background: var(--bg-tertiary);
-			border: 1px solid var(--border);
+			background: rgba(29, 36, 48, 0.9);
+			border: 1px solid rgba(255, 255, 255, 0.08);
 			border-radius: 6px;
 			color: var(--text-primary);
 			font-size: 13px;
@@ -2328,22 +2489,25 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 		.input-field:focus {
 			outline: none;
-			border-color: var(--accent);
+			border-color: rgba(244, 184, 96, 0.6);
+			box-shadow: 0 0 0 3px rgba(244, 184, 96, 0.15);
 		}
 
 		.send-btn {
 			padding: 0 16px;
-			background: var(--accent);
+			background: linear-gradient(135deg, rgba(244, 184, 96, 0.95), rgba(95, 180, 168, 0.9));
 			border: none;
 			border-radius: 6px;
-			color: white;
+			color: #111;
 			font-size: 13px;
 			cursor: pointer;
 			font-weight: 500;
+			box-shadow: 0 8px 20px rgba(95, 180, 168, 0.2);
 		}
 
 		.send-btn:hover {
-			background: var(--accent-hover);
+			transform: translateY(-1px);
+			box-shadow: 0 10px 22px rgba(95, 180, 168, 0.3);
 		}
 
 		.send-btn:disabled {
@@ -2370,8 +2534,8 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			align-items: center;
 			gap: 6px;
 			padding: 6px 10px;
-			background: var(--bg-tertiary);
-			border: 1px solid var(--border);
+			background: rgba(29, 36, 48, 0.9);
+			border: 1px solid rgba(255, 255, 255, 0.08);
 			border-radius: 6px;
 			color: var(--text-primary);
 			font-size: 11px;
@@ -2380,7 +2544,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		}
 
 		.model-btn:hover {
-			border-color: var(--accent);
+			border-color: rgba(244, 184, 96, 0.6);
 		}
 
 		.model-btn svg {
@@ -2401,10 +2565,10 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			bottom: calc(100% + 6px);
 			min-width: 220px;
 			max-width: calc(100vw - 24px);
-			background: var(--bg-secondary);
-			border: 1px solid var(--border);
+			background: rgba(21, 26, 34, 0.96);
+			border: 1px solid rgba(255, 255, 255, 0.08);
 			border-radius: 10px;
-			box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+			box-shadow: var(--shadow);
 			padding: 6px;
 			display: none;
 			z-index: 10;
@@ -2428,12 +2592,12 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		}
 
 		.model-item:hover {
-			background: var(--bg-tertiary);
+			background: rgba(29, 36, 48, 0.9);
 		}
 
 		.model-item.active {
-			background: rgba(14, 99, 156, 0.25);
-			border: 1px solid rgba(14, 99, 156, 0.4);
+			background: rgba(95, 180, 168, 0.2);
+			border: 1px solid rgba(95, 180, 168, 0.4);
 		}
 
 		.model-check {
@@ -2446,16 +2610,16 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		}
 
 		.scrollbar-thin::-webkit-scrollbar-track {
-			background: var(--bg-primary);
+			background: rgba(15, 17, 21, 0.8);
 		}
 
 		.scrollbar-thin::-webkit-scrollbar-thumb {
-			background: var(--border);
+			background: rgba(255, 255, 255, 0.12);
 			border-radius: 4px;
 		}
 
 		.scrollbar-thin::-webkit-scrollbar-thumb:hover {
-			background: var(--text-secondary);
+			background: rgba(244, 184, 96, 0.35);
 		}
 			
 		/* Sidebar toggle overrides */
@@ -2489,6 +2653,12 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		.main {
 			position: relative;
 			width: 100%;
+			padding-left: var(--sidebar-width);
+			transition: padding-left 0.2s ease;
+		}
+
+		body.sidebar-collapsed .main {
+			padding-left: 0;
 		}
 
 		.topbar {
@@ -2498,10 +2668,11 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			gap: 8px;
 			padding: 0 12px;
 			border-bottom: 1px solid var(--border);
-			background: var(--bg-secondary);
+			background: rgba(21, 26, 34, 0.9);
 			flex-shrink: 0;
 			position: relative;
 			z-index: 6;
+			backdrop-filter: blur(6px);
 		}
 
 		.topbar-title {
@@ -2516,9 +2687,9 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			padding: 4px 8px;
 			border-radius: 999px;
 			font-size: 10px;
-			border: 1px solid var(--border);
+			border: 1px solid rgba(255, 255, 255, 0.08);
 			color: var(--text-secondary);
-			background: var(--bg-tertiary);
+			background: rgba(29, 36, 48, 0.7);
 			white-space: nowrap;
 		}
 
@@ -2528,38 +2699,40 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 		.status-pill.starting {
 			color: #ffd37a;
-			border-color: #8a6d3b;
-			background: rgba(138, 109, 59, 0.2);
+			border-color: rgba(244, 184, 96, 0.6);
+			background: rgba(244, 184, 96, 0.15);
 		}
 
 		.status-pill.ready {
 			color: #7ee3b2;
-			border-color: #2e7d59;
-			background: rgba(46, 125, 89, 0.2);
+			border-color: rgba(95, 180, 168, 0.6);
+			background: rgba(95, 180, 168, 0.15);
 		}
 
 		.status-pill.error {
 			color: #f48771;
-			border-color: #a94442;
-			background: rgba(169, 68, 66, 0.2);
+			border-color: rgba(244, 135, 113, 0.6);
+			background: rgba(244, 135, 113, 0.15);
 		}
 
 		.icon-btn {
 			width: 28px;
 			height: 28px;
 			border-radius: 6px;
-			border: 1px solid var(--border);
-			background: var(--bg-tertiary);
+			border: 1px solid rgba(255, 255, 255, 0.08);
+			background: rgba(29, 36, 48, 0.7);
 			color: var(--text-primary);
 			display: inline-flex;
 			align-items: center;
 			justify-content: center;
 			cursor: pointer;
+			transition: transform 0.15s ease, border-color 0.2s ease, background 0.2s ease;
 		}
 
 		.icon-btn:hover {
-			border-color: var(--accent);
-			background: var(--bg-secondary);
+			border-color: rgba(244, 184, 96, 0.6);
+			background: rgba(21, 26, 34, 0.9);
+			transform: translateY(-1px);
 		}
 
 		.icon-btn svg {
@@ -2570,7 +2743,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		.confirm-overlay {
 			position: fixed;
 			inset: 0;
-			background: rgba(0, 0, 0, 0.55);
+			background: rgba(5, 8, 12, 0.72);
 			display: none;
 			align-items: center;
 			justify-content: center;
@@ -2584,11 +2757,11 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		.confirm-modal {
 			width: 90%;
 			max-width: 420px;
-			background: var(--bg-secondary);
-			border: 1px solid var(--border);
+			background: rgba(21, 26, 34, 0.96);
+			border: 1px solid rgba(255, 255, 255, 0.08);
 			border-radius: 10px;
 			padding: 16px;
-			box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+			box-shadow: var(--shadow);
 		}
 
 		.confirm-title {
@@ -2619,16 +2792,18 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		.confirm-btn {
 			padding: 6px 10px;
 			border: 1px solid var(--border);
-			background: var(--bg-tertiary);
+			background: rgba(29, 36, 48, 0.8);
 			color: var(--text-primary);
 			border-radius: 6px;
 			cursor: pointer;
 			font-size: 12px;
+			transition: transform 0.15s ease, border-color 0.2s ease, background 0.2s ease;
 		}
 
 		.confirm-btn:hover {
-			border-color: var(--accent);
-			background: var(--bg-secondary);
+			border-color: rgba(244, 184, 96, 0.6);
+			background: rgba(244, 184, 96, 0.15);
+			transform: translateY(-1px);
 		}
 
 	</style>
@@ -2712,6 +2887,8 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 }
 
 export function deactivate() {}
+
+
 
 
 

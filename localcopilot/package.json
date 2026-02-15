@@ -10,43 +10,53 @@
                        "Other"
                    ],
     "activationEvents":  [
-                             "onView:localcopilot.agentView"
+                             "onView:codemate.agentView"
                          ],
     "main":  "./out/extension.js",
     "contributes":  {
                         "commands":  [
                                          {
-                                             "command":  "localcopilot.helloWorld",
+                                             "command":  "codemate.helloWorld",
                                              "title":  "Hello World"
                                          },
                                          {
-                                             "command":  "localcopilot.githubManager",
+                                             "command":  "codemate.githubManager",
                                              "title":  "CodeMate: GitHub Manager (Test)"
                                          }
                                      ],
                         "configuration":  {
-                                              "title":  "LocalCopilot",
+                                              "title":  "CodeMate",
                                               "properties":  {
-                                                                 "localcopilot.inlineModel":  {
+                                                                 "codemate.inlineModel":  {
                                                                                                   "type":  "string",
                                                                                                   "default":  "",
                                                                                                   "description":  "Ollama model for inline completions. Leave empty to use the first available model."
+                                                                                              },
+                                                                 "codemate.groqApiKey":  {
+                                                                                                  "type":  "string",
+                                                                                                  "default":  "",
+                                                                                                  "description":  "Groq API key for model list and requests."
+                                                                                              },
+                                                                 "codemate.pythonPath":  {
+                                                                                                  "type":  "string",
+                                                                                                  "default":  "",
+                                                                                                  "description":  "Optional Python command for MCP/agents (e.g. \"py -3\" or full path). If empty, uses py -3 on Windows, python3 on Unix."
                                                                                               }
                                                              }
                                           },
                         "viewsContainers":  {
                                                 "activitybar":  [
                                                                     {
-                                                                        "id":  "localcopilot",
+                                                                        "id":  "codemate",
                                                                         "title":  "CodeMate",
                                                                         "icon":  "media/icon.svg"
                                                                     }
                                                                 ]
                                             },
                         "views":  {
-                                      "localcopilot":  [
+                                      "codemate":  [
                                                            {
-                                                               "id":  "localcopilot.agentView",
+                                                               "id":  "codemate.agentView",
                                                                "name":  "CodeMate Agent",
                                                                "type":  "webview"
                                                            }
@@ -77,3 +87,4 @@
                        "url":  "https://github.com/AyushKaithwas978/CodeMate"
                    }
 }
+

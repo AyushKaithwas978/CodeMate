@@ -28,7 +28,7 @@ CodeMate is a local-first coding assistant for VS Code that uses Ollama to provi
 5. Ask for changes or explanations, or just start typing to trigger inline completions.
 
 ## Extension Settings
-- `localcopilot.inlineModel`: Ollama model for inline completions. Leave empty to use the first available model.
+- `codemate.inlineModel`: Ollama model for inline completions. Leave empty to use the first available model.
 
 ## Notes
 - All requests go to your local Ollama instance; nothing is sent to external services.
