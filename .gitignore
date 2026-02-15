@@ -1,2 +1,8 @@
 .vscode
 node_modules
+.env
+localcopilot/out
+localcopilot/dist
+localcopilot/node_modules
+localcopilot/.vscode-test/
+localcopilot/*.vsix

@@ -18,6 +18,10 @@
                                          {
                                              "command":  "localcopilot.helloWorld",
                                              "title":  "Hello World"
+                                         },
+                                         {
+                                             "command":  "localcopilot.githubManager",
+                                             "title":  "CodeMate: GitHub Manager (Test)"
                                          }
                                      ],
                         "configuration":  {

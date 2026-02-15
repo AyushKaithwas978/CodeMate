@@ -10,12 +10,25 @@
 	const toggleBtn = document.getElementById('toggleSidebar');
 	const chatsContainer = document.getElementById('chats');
 	const newChatBtn = document.getElementById('newChat');
+	const clearHistoryBtn = document.getElementById('clearHistory');
 	const messagesContainer = document.getElementById('messages');
 	const input = document.getElementById('input');
 	const sendBtn = document.getElementById('send');
 	const modelButton = document.getElementById('modelButton');
 	const modelLabel = document.getElementById('modelLabel');
 	const modelMenu = document.getElementById('modelMenu');
+	const agentStatus = document.getElementById('agentStatus');
+	const confirmOverlay = document.getElementById('confirmOverlay');
+	const confirmTitle = document.getElementById('confirmTitle');
+	const confirmDetail = document.getElementById('confirmDetail');
+	const confirmButtons = document.getElementById('confirmButtons');
+	const settingsBtn = document.getElementById('settingsButton');
+	const settingsOverlay = document.getElementById('settingsOverlay');
+	const groqModelSelect = document.getElementById('groqModelSelect');
+	const groqModelInput = document.getElementById('groqModelInput');
+	const groqRefreshBtn = document.getElementById('groqRefresh');
+	const groqSaveBtn = document.getElementById('groqSave');
+	const groqTestBtn = document.getElementById('groqTest');
 	let availableModels = [];
 	let currentModel = '';
 
@@ -53,6 +66,40 @@
 		if (newChatBtn) {
 			newChatBtn.addEventListener('click', () => {
 				vscode.postMessage({ type: 'newChat' });
+			});
+		}
+		
+		if (clearHistoryBtn) {
+			clearHistoryBtn.addEventListener('click', () => {
+				vscode.postMessage({ type: 'clearHistory' });
+			});
+		}
+
+		if (settingsBtn) {
+			settingsBtn.addEventListener('click', () => {
+				openSettings();
+			});
+		}
+
+		if (groqRefreshBtn) {
+			groqRefreshBtn.addEventListener('click', () => {
+				vscode.postMessage({ type: 'refreshGroqModels' });
+			});
+		}
+
+		if (groqSaveBtn) {
+			groqSaveBtn.addEventListener('click', () => {
+				const selected = groqModelSelect?.value || '';
+				const manual = groqModelInput?.value || '';
+				const model = manual.trim() || selected.trim();
+				vscode.postMessage({ type: 'saveGroqModel', model });
+				closeSettings();
+			});
+		}
+
+		if (groqTestBtn) {
+			groqTestBtn.addEventListener('click', () => {
+				vscode.postMessage({ type: 'testGroq' });
 			});
 		}
 
@@ -143,8 +190,107 @@
 				messages = [];
 				messagesContainer.innerHTML = '';
 				break;
+			case 'confirmAction':
+				showConfirm(message);
+				break;
+			case 'openSettings':
+				openSettings();
+				break;
+			case 'groqModelsLoaded':
+				updateGroqModels(message.models || []);
+				break;
+			case 'groqModelSaved':
+				if (groqModelInput) groqModelInput.value = message.model || '';
+				if (groqModelSelect && message.model) {
+					const model = String(message.model);
+					if (Array.from(groqModelSelect.options).some((opt) => opt.value === model)) {
+						groqModelSelect.value = model;
+					}
+				}
+				break;
+			case 'groqTestResult':
+				showConfirm({
+					id: `groq_test_${Date.now()}`,
+					title: message.ok ? 'Groq Test सफल' : 'Groq Test Failed',
+					detail: message.message || '',
+					choices: ['OK']
+				});
+				break;
+			case 'agentStatus':
+				updateAgentStatus(message.status, message.detail);
+				break;
 		}
 	});
+
+	function updateAgentStatus(status, detail) {
+		if (!agentStatus) return;
+		const labelMap = {
+			starting: 'Agent: starting',
+			ready: 'Agent: ready',
+			error: 'Agent: error'
+		};
+		agentStatus.classList.remove('hidden', 'starting', 'ready', 'error');
+		if (!status) {
+			agentStatus.classList.add('hidden');
+			return;
+		}
+		agentStatus.classList.add(status);
+		agentStatus.textContent = labelMap[status] || 'Agent: status';
+		if (status === 'error' && detail) {
+			agentStatus.title = `Agent service error: ${detail}`;
+		} else {
+			agentStatus.title = '';
+		}
+	}
+
+	function openSettings() {
+		if (!settingsOverlay) return;
+		settingsOverlay.classList.add('open');
+	}
+
+	function closeSettings() {
+		if (!settingsOverlay) return;
+		settingsOverlay.classList.remove('open');
+	}
+
+	function updateGroqModels(models) {
+		if (!groqModelSelect) return;
+		groqModelSelect.innerHTML = '';
+		const placeholder = document.createElement('option');
+		placeholder.value = '';
+		placeholder.textContent = 'Select Groq model';
+		groqModelSelect.appendChild(placeholder);
+		models.forEach((model) => {
+			const opt = document.createElement('option');
+			opt.value = model;
+			opt.textContent = model;
+			groqModelSelect.appendChild(opt);
+		});
+		const saved = (groqModelInput?.value || '').trim();
+		if (saved && Array.from(groqModelSelect.options).some((opt) => opt.value === saved)) {
+			groqModelSelect.value = saved;
+		}
+	}
+
+	function showConfirm(message) {
+		if (!confirmOverlay) return;
+		confirmTitle.textContent = message.title || 'Confirm';
+		confirmDetail.textContent = message.detail || '';
+		confirmButtons.innerHTML = '';
+
+		(message.choices || ['OK']).forEach((choice) => {
+			const btn = document.createElement('button');
+			btn.className = 'confirm-btn';
+			btn.textContent = choice;
+			btn.addEventListener('click', () => {
+				confirmOverlay.classList.remove('open');
+				vscode.postMessage({ type: 'confirmResult', id: message.id, choice });
+			});
+			confirmButtons.appendChild(btn);
+		});
+
+		confirmOverlay.classList.add('open');
+	}
 
 	function handleModelsLoaded(models, selectedModel) {
 		availableModels = Array.isArray(models) ? models : [];
@@ -365,12 +511,13 @@
 	}
 
 	function formatMessageContent(content) {
-		// Remove code blocks temporarily
-		const codeBlocks = [];
+		// Render code blocks inline
 		let formatted = content.replace(/```(\w+)?\n([\s\S]*?)```/g, (match, lang, code) => {
-			const placeholder = `__CODE_BLOCK_${codeBlocks.length}__`;
-			codeBlocks.push({ lang, code });
-			return placeholder;
+			const safeCode = code
+				.replace(/&/g, '&amp;')
+				.replace(/</g, '&lt;')
+				.replace(/>/g, '&gt;');
+			return `<pre><code>${safeCode}</code></pre>`;
 		});
 
 		// Convert markdown-style formatting
@@ -379,11 +526,6 @@
 			.replace(/\*(.+?)\*/g, '<em>$1</em>')
 			.replace(/`(.+?)`/g, '<code>$1</code>')
 			.replace(/\n/g, '<br>');
-
-		// Restore code blocks (but don't render them here - they're handled separately)
-		codeBlocks.forEach((block, index) => {
-			formatted = formatted.replace(`__CODE_BLOCK_${index}__`, '');
-		});
 
 		return formatted;
 	}
@@ -411,6 +553,7 @@
 			const applyBtn = document.createElement('button');
 			applyBtn.textContent = 'Apply';
 			applyBtn.addEventListener('click', () => {
+				console.log('[LocalCopilot] Apply clicked', { messageId, changeIndex });
 				vscode.postMessage({ 
 					type: 'applyChange', 
 					messageId, 
@@ -421,6 +564,7 @@
 			const rejectBtn = document.createElement('button');
 			rejectBtn.textContent = 'Reject';
 			rejectBtn.addEventListener('click', () => {
+				console.log('[LocalCopilot] Reject clicked', { messageId, changeIndex });
 				vscode.postMessage({ 
 					type: 'rejectChange', 
 					messageId, 
