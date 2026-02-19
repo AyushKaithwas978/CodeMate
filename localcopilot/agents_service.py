@@ -161,11 +161,12 @@ class ReadmeAgent(BaseAgent):
         project_name = payload.get("project_name", "Project")
         summary = payload.get("summary", "")
         bullets = payload.get("bullets", [])
+        instructions = payload.get("instructions") or payload.get("request") or ""
         repo_path = payload.get("repo_path")
         write_file = bool(payload.get("write", False))
 
         model = payload.get("model") or os.getenv("OLLAMA_README_MODEL") or "qwen2.5-coder:1.5b"
-        prompt = build_readme_prompt(project_name, summary, bullets)
+        prompt = build_readme_prompt(project_name, summary, bullets, instructions)
 
         try:
             content = ollama_generate(model, prompt)
@@ -270,12 +271,14 @@ def shutil_which(name: str) -> bool:
         return False
 
 
-def build_readme_prompt(project_name: str, summary: str, bullets: list[str]) -> str:
+def build_readme_prompt(project_name: str, summary: str, bullets: list[str], instructions: str = "") -> str:
     bullet_text = "\n".join(f"- {b}" for b in bullets if b)
+    instruction_text = f"User request: {instructions}\n" if instructions else ""
     return (
         "Write a concise, professional GitHub README.\n"
         f"Project name: {project_name}\n"
         f"Summary: {summary}\n"
+        f"{instruction_text}"
         "Requirements:\n"
         "- Use Markdown headers\n"
         "- Include sections: Overview, Highlights, Quickstart, License\n"

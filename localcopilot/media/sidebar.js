@@ -22,6 +22,7 @@
 	const confirmTitle = document.getElementById('confirmTitle');
 	const confirmDetail = document.getElementById('confirmDetail');
 	const confirmButtons = document.getElementById('confirmButtons');
+	const profileBtn = document.getElementById('profileButton');
 	const settingsBtn = document.getElementById('settingsButton');
 	const settingsOverlay = document.getElementById('settingsOverlay');
 	const groqModelSelect = document.getElementById('groqModelSelect');
@@ -29,6 +30,14 @@
 	const groqRefreshBtn = document.getElementById('groqRefresh');
 	const groqSaveBtn = document.getElementById('groqSave');
 	const groqTestBtn = document.getElementById('groqTest');
+	const githubTokenInput = document.getElementById('githubTokenInput');
+	const groqApiKeyInput = document.getElementById('groqApiKeyInput');
+	const githubOwnerInput = document.getElementById('githubOwnerInput');
+	const githubTokenStatus = document.getElementById('githubTokenStatus');
+	const groqApiKeyStatus = document.getElementById('groqApiKeyStatus');
+	const githubOwnerStatus = document.getElementById('githubOwnerStatus');
+	const credSaveBtn = document.getElementById('credSave');
+	const credClearBtn = document.getElementById('credClear');
 	let availableModels = [];
 	let currentModel = '';
 
@@ -81,6 +90,12 @@
 			});
 		}
 
+		if (profileBtn) {
+			profileBtn.addEventListener('click', () => {
+				openSettings();
+			});
+		}
+
 		if (groqRefreshBtn) {
 			groqRefreshBtn.addEventListener('click', () => {
 				vscode.postMessage({ type: 'refreshGroqModels' });
@@ -100,6 +115,32 @@
 		if (groqTestBtn) {
 			groqTestBtn.addEventListener('click', () => {
 				vscode.postMessage({ type: 'testGroq' });
+			});
+		}
+
+		if (credSaveBtn) {
+			credSaveBtn.addEventListener('click', () => {
+				const githubToken = githubTokenInput?.value || '';
+				const groqApiKey = groqApiKeyInput?.value || '';
+				const githubOwnerName = githubOwnerInput?.value || '';
+				vscode.postMessage({
+					type: 'saveCredentials',
+					githubToken: githubToken.trim(),
+					groqApiKey: groqApiKey.trim(),
+					githubOwnerName: githubOwnerName.trim()
+				});
+				if (githubTokenInput) githubTokenInput.value = '';
+				if (groqApiKeyInput) groqApiKeyInput.value = '';
+				if (githubOwnerInput) githubOwnerInput.value = '';
+			});
+		}
+
+		if (credClearBtn) {
+			credClearBtn.addEventListener('click', () => {
+				vscode.postMessage({ type: 'clearCredentials' });
+				if (githubTokenInput) githubTokenInput.value = '';
+				if (groqApiKeyInput) groqApiKeyInput.value = '';
+				if (githubOwnerInput) githubOwnerInput.value = '';
 			});
 		}
 
@@ -219,6 +260,9 @@
 			case 'agentStatus':
 				updateAgentStatus(message.status, message.detail);
 				break;
+			case 'credentialsStatus':
+				updateCredentialStatus(message.status || {});
+				break;
 		}
 	});
 
@@ -246,6 +290,10 @@
 	function openSettings() {
 		if (!settingsOverlay) return;
 		settingsOverlay.classList.add('open');
+		if (githubTokenInput) githubTokenInput.value = '';
+		if (groqApiKeyInput) groqApiKeyInput.value = '';
+		if (githubOwnerInput) githubOwnerInput.value = '';
+		vscode.postMessage({ type: 'requestCredentialsStatus' });
 	}
 
 	function closeSettings() {
@@ -270,6 +318,16 @@
 		if (saved && Array.from(groqModelSelect.options).some((opt) => opt.value === saved)) {
 			groqModelSelect.value = saved;
 		}
+	}
+
+	function updateCredentialStatus(status) {
+		const setStatus = (el, isSet) => {
+			if (!el) return;
+			el.textContent = isSet ? 'Saved' : 'Not set';
+		};
+		setStatus(githubTokenStatus, !!status.githubToken);
+		setStatus(groqApiKeyStatus, !!status.groqApiKey);
+		setStatus(githubOwnerStatus, !!status.githubOwnerName);
 	}
 
 	function showConfirm(message) {

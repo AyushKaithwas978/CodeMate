@@ -177,6 +177,9 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	private readonly currentSessionStorageKey = 'codemate.currentSession';
 	private readonly currentModelStorageKey = 'codemate.currentModel';
 	private readonly groqModelStorageKey = 'codemate.groqModel';
+	private readonly githubTokenSecretKey = 'codemate.githubToken';
+	private readonly groqApiKeySecretKey = 'codemate.groqApiKey';
+	private readonly githubOwnerNameSecretKey = 'codemate.githubOwnerName';
 	private pendingConfirms = new Map<string, (choice: string | null) => void>();
 	private agentServiceProcess: import('child_process').ChildProcess | undefined;
 	private agentServiceStarting: Promise<boolean> | null = null;
@@ -277,6 +280,52 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
+	private async getSecret(key: string): Promise<string | null> {
+		try {
+			const value = await this.context.secrets.get(key);
+			return value?.trim() || null;
+		} catch {
+			return null;
+		}
+	}
+
+	private async setSecret(key: string, value: string | null): Promise<void> {
+		try {
+			if (value && value.trim()) {
+				await this.context.secrets.store(key, value.trim());
+			} else {
+				await this.context.secrets.delete(key);
+			}
+		} catch {
+			// ignore secret storage errors
+		}
+	}
+
+	private async sendCredentialsStatus(): Promise<void> {
+		const githubToken = await this.getSecret(this.githubTokenSecretKey);
+		const groqApiKey = await this.getSecret(this.groqApiKeySecretKey);
+		const githubOwnerName = await this.getSecret(this.githubOwnerNameSecretKey);
+		this.postToWebview({
+			type: 'credentialsStatus',
+			status: {
+				githubToken: !!githubToken,
+				groqApiKey: !!groqApiKey,
+				githubOwnerName: !!githubOwnerName
+			}
+		});
+	}
+
+	private async buildSecretEnv(): Promise<Record<string, string>> {
+		const env: Record<string, string> = {};
+		const githubToken = await this.getSecret(this.githubTokenSecretKey);
+		const groqApiKey = await this.getSecret(this.groqApiKeySecretKey);
+		const githubOwnerName = await this.getSecret(this.githubOwnerNameSecretKey);
+		if (githubToken) env.GITHUB_TOKEN = githubToken;
+		if (groqApiKey) env.GROQ_API_KEY = groqApiKey;
+		if (githubOwnerName) env.GITHUB_OWNER_NAME = githubOwnerName;
+		return env;
+	}
+
 	private resolveAgentServicePath(): string | null {
 		const fs = require('fs');
 		const candidates: string[] = [];
@@ -348,6 +397,26 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 					this.groqModel = String(message.model || '').trim();
 					void this.context.globalState.update(this.groqModelStorageKey, this.groqModel);
 					this.postToWebview({ type: 'groqModelSaved', model: this.groqModel });
+					break;
+				case 'saveCredentials':
+					{
+						const githubToken = String(message.githubToken || '').trim();
+						const groqApiKey = String(message.groqApiKey || '').trim();
+						const githubOwnerName = String(message.githubOwnerName || '').trim();
+						if (githubToken) await this.setSecret(this.githubTokenSecretKey, githubToken);
+						if (groqApiKey) await this.setSecret(this.groqApiKeySecretKey, groqApiKey);
+						if (githubOwnerName) await this.setSecret(this.githubOwnerNameSecretKey, githubOwnerName);
+						await this.sendCredentialsStatus();
+					}
+					break;
+				case 'clearCredentials':
+					await this.setSecret(this.githubTokenSecretKey, null);
+					await this.setSecret(this.groqApiKeySecretKey, null);
+					await this.setSecret(this.githubOwnerNameSecretKey, null);
+					await this.sendCredentialsStatus();
+					break;
+				case 'requestCredentialsStatus':
+					await this.sendCredentialsStatus();
 					break;
 				case 'testGroq':
 					await this.runGroqTest();
@@ -527,6 +596,31 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		if (this.lastFileEditor && this.lastFileEditor.document.uri.scheme === 'file') return this.lastFileEditor;
 		return undefined;
 	}
+
+	private resolveFollowUpRequest(content: string, session: ChatSession): string | null {
+		const text = content.trim().toLowerCase();
+		if (!text) return null;
+
+		const isAffirmation = /^(yes|yep|yeah|sure|ok|okay|please|go ahead|do it|do this|proceed|make it|update it|you can|sounds good|alright)\b/.test(text);
+		if (!isAffirmation) return null;
+
+		for (let i = session.messages.length - 2; i >= 0; i--) {
+			const msg = session.messages[i];
+			if (msg.role === 'user' && /readme/i.test(msg.content)) {
+				return msg.content;
+			}
+		}
+
+		for (let i = session.messages.length - 2; i >= 0; i--) {
+			const msg = session.messages[i];
+			if (msg.role === 'assistant' && /readme/i.test(msg.content)) {
+				return `Update README.md as discussed. ${msg.content}`;
+			}
+		}
+
+		return null;
+	}
+
 	private async handleUserMessage(content: string): Promise<void> {
 		if (!content.trim()) return;
 		this.ensureSessionsLoaded();
@@ -554,8 +648,10 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		this.updateSessionMetadata(session, userMessage.content);
 		this.postToWebview({ type: 'messageAdded', message: userMessage });
 
+		const resolvedRequest = this.resolveFollowUpRequest(content, session) ?? content;
+
 		// Manager flow: file creation (with optional git actions)
-		if (this.isFileCreateRequest(content)) {
+		if (this.isFileCreateRequest(resolvedRequest)) {
 			const assistantMessage: ChatMessage = {
 				id: this.generateId(),
 				role: 'assistant',
@@ -565,12 +661,12 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			};
 			session.messages.push(assistantMessage);
 			this.postToWebview({ type: 'messageAdded', message: assistantMessage });
-			await this.runFileAndGitFlowFromChat(content, assistantMessage);
+			await this.runFileAndGitFlowFromChat(resolvedRequest, assistantMessage);
 			return;
 		}
 
 		// Manager flow: detect GitHub automation intent in chat
-		if (this.isGithubAutomationRequest(content)) {
+		if (this.isGithubAutomationRequest(resolvedRequest)) {
 			const assistantMessage: ChatMessage = {
 				id: this.generateId(),
 				role: 'assistant',
@@ -580,7 +676,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			};
 			session.messages.push(assistantMessage);
 			this.postToWebview({ type: 'messageAdded', message: assistantMessage });
-			await this.runGithubManagerFlowFromChat(assistantMessage, userMessage.content);
+			await this.runGithubManagerFlowFromChat(assistantMessage, resolvedRequest);
 			return;
 		}
 
@@ -721,14 +817,18 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 	private isGithubAutomationRequest(content: string): boolean {
 		const text = content.toLowerCase();
-		const wantsReadme = text.includes('readme');
+		const readmeMentioned = /\breadme\b/.test(text) || text.includes('read me');
+		const readmeAction = /(update|edit|write|generate|create|rewrite|refresh|improve|add|draft|make)/.test(text);
+		const wantsReadme = readmeMentioned && readmeAction;
 		const wantsCommit = text.includes('commit');
 		const wantsPush = text.includes('push') || text.includes('publish');
 		const wantsAdd = /\badd\b/.test(text) || text.includes('stage') || text.includes('git add');
 		const mentionsGitHost = /(github|git hub|githb|githu|githug|gitlab|bitbucket|repo|repository)/.test(text);
 		const mentionsGit = /\bgit\b/.test(text);
 		const wantsGitOps = wantsCommit || wantsPush || wantsReadme || wantsAdd;
-		return wantsGitOps && (mentionsGitHost || mentionsGit || wantsCommit || wantsPush);
+		if (!wantsGitOps) return false;
+		if (wantsReadme) return true;
+		return mentionsGitHost || mentionsGit || wantsCommit || wantsPush;
 	}
 
 	private async runFileAndGitFlowFromChat(request: string, assistantMessage: ChatMessage): Promise<void> {
@@ -923,7 +1023,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async callGroqChat(system: string, prompt: string): Promise<string> {
-		const apiKey = this.loadGroqApiKey();
+		const apiKey = await this.loadGroqApiKey();
 		if (!apiKey) {
 			throw new Error('GROQ_API_KEY not set');
 		}
@@ -962,7 +1062,9 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		return content;
 	}
 
-	private loadGroqApiKey(): string | null {
+	private async loadGroqApiKey(): Promise<string | null> {
+		const secret = await this.getSecret(this.groqApiKeySecretKey);
+		if (secret) return secret;
 		const configured = vscode.workspace.getConfiguration('codemate').get<string>('groqApiKey');
 		if (configured?.trim()) return configured.trim();
 		if (process.env.GROQ_API_KEY) return process.env.GROQ_API_KEY;
@@ -972,7 +1074,9 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	}
 
 
-	private loadGithubOwnerName(): string | null {
+	private async loadGithubOwnerName(): Promise<string | null> {
+		const secret = await this.getSecret(this.githubOwnerNameSecretKey);
+		if (secret) return secret;
 		if (process.env.GITHUB_OWNER_NAME) return process.env.GITHUB_OWNER_NAME;
 		const envVars = this.loadDotEnvVars();
 		if (envVars.GITHUB_OWNER_NAME) return envVars.GITHUB_OWNER_NAME;
@@ -1127,7 +1231,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async sendGroqModelsToWebview(): Promise<void> {
-		const apiKey = this.loadGroqApiKey();
+		const apiKey = await this.loadGroqApiKey();
 		if (!apiKey) {
 			this.postToWebview({ type: 'groqModelsLoaded', models: [] });
 			return;
@@ -1183,17 +1287,15 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 				return;
 			}
 
-			const statusRes = await this.callMcpTool('git_status', { repo_path: repoPath });
-			const statusText = typeof statusRes?.data?.stdout === 'string' ? statusRes.data.stdout : '';
-			if (!statusText.trim()) {
+			const wantsReadme = /readme/i.test(request);
+			const preStatusRes = await this.callMcpTool('git_status', { repo_path: repoPath });
+			const preStatusText = typeof preStatusRes?.data?.stdout === 'string' ? preStatusRes.data.stdout : '';
+			if (!preStatusText.trim() && !wantsReadme) {
 				assistantMessage.content = 'No changes detected to commit.';
 				assistantMessage.thinking = undefined;
 				this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
 				return;
 			}
-			const { commitMessage, description } = await this.generateCommitAndDescription(request, statusText);
-
-			const wantsReadme = /readme/i.test(request);
 			if (wantsReadme) {
 				let readmeOk = false;
 				try {
@@ -1211,6 +1313,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 						project_name: projectName,
 						summary,
 						bullets,
+						instructions: request,
 						repo_path: repoPath,
 						write: true,
 						model: 'qwen2.5-coder:1.5b'
@@ -1222,7 +1325,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 				}
 
 				if (!readmeOk) {
-					readmeOk = await this.generateReadmeFallback(repoPath, request, statusText);
+					readmeOk = await this.generateReadmeFallback(repoPath, request, preStatusText);
 				}
 
 				if (!readmeOk) {
@@ -1232,6 +1335,19 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 					return;
 				}
 			}
+
+			const statusRes = await this.callMcpTool('git_status', { repo_path: repoPath });
+			const statusText = typeof statusRes?.data?.stdout === 'string' ? statusRes.data.stdout : '';
+			if (!statusText.trim()) {
+				assistantMessage.content = wantsReadme
+					? 'README already up to date. No changes detected to commit.'
+					: 'No changes detected to commit.';
+				assistantMessage.thinking = undefined;
+				this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+				return;
+			}
+
+			const { commitMessage, description } = await this.generateCommitAndDescription(request, statusText);
 
 			let remoteUrl = await this.getGitRemoteUrl(repoPath);
 			let owner: string | null = null;
@@ -1249,7 +1365,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 				}
 			} else {
 				repo = path.basename(repoPath);
-				owner = this.loadGithubOwnerName();
+				owner = await this.loadGithubOwnerName();
 
 				const createRes = await this.callMcpTool('github_create_repo', {
 					name: repo,
@@ -1268,7 +1384,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 				}
 
 				if (!owner || !repo) {
-					assistantMessage.content = 'Could not resolve GitHub owner/repo. Set GITHUB_OWNER_NAME in mcp_server/.env or add an origin remote.';
+					assistantMessage.content = 'Could not resolve GitHub owner/repo. Set GITHUB_OWNER_NAME in Settings (or mcp_server/.env) or add an origin remote.';
 					assistantMessage.thinking = undefined;
 					this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
 					return;
@@ -1942,11 +2058,12 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			try {
 				const { spawn } = await import('child_process');
 				const python = this.resolvePythonCommand();
+				const secretEnv = await this.buildSecretEnv();
 				this.output.appendLine('[AgentService] Starting agents_service.py...');
 				const proc = spawn(python.cmd, [...python.args, servicePath], {
 					cwd: path.dirname(servicePath),
 					stdio: ['ignore', 'pipe', 'pipe'],
-					env: { ...process.env, ...this.loadDotEnvVars() },
+					env: { ...process.env, ...this.loadDotEnvVars(), ...secretEnv },
 					detached: true
 				});
 				this.agentServiceProcess = proc;
@@ -1998,6 +2115,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	private async callMcpTool(toolName: string, args: Record<string, unknown>): Promise<any> {
 		const { spawn } = await import('child_process');
 		const python = this.resolvePythonCommand();
+		const secretEnv = await this.buildSecretEnv();
 
 		return new Promise((resolve, reject) => {
 			const mcpCwd = this.resolveMcpServerPath();
@@ -2008,7 +2126,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			const proc = spawn(python.cmd, [...python.args, 'server.py'], {
 				cwd: mcpCwd,
 				stdio: ['pipe', 'pipe', 'pipe'],
-				env: { ...process.env, ...this.loadDotEnvVars() }
+				env: { ...process.env, ...this.loadDotEnvVars(), ...secretEnv }
 			});
 
 			const send = (msg: any) => {
@@ -2073,6 +2191,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 				this.postToWebview({ type: 'groqModelSaved', model: this.groqModel });
 				await this.sendGroqModelsToWebview();
 			}
+			await this.sendCredentialsStatus();
 
 			// Load sessions
 			this.ensureSessionsLoaded();
@@ -2795,6 +2914,8 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		.confirm-actions {
 			display: flex;
 			gap: 8px;
+			flex-wrap: wrap;
+			row-gap: 8px;
 			margin-top: 12px;
 			justify-content: flex-end;
 		}
@@ -2814,6 +2935,57 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			border-color: rgba(244, 184, 96, 0.6);
 			background: rgba(244, 184, 96, 0.15);
 			transform: translateY(-1px);
+		}
+
+		.settings-detail {
+			white-space: normal;
+		}
+
+		.settings-section {
+			display: flex;
+			flex-direction: column;
+			gap: 10px;
+			padding: 8px 0;
+		}
+
+		.section-title {
+			font-size: 12px;
+			text-transform: uppercase;
+			letter-spacing: 0.08em;
+			color: var(--text-secondary);
+		}
+
+		.settings-field {
+			display: flex;
+			flex-direction: column;
+			gap: 6px;
+		}
+
+		.field-label {
+			font-size: 11px;
+			color: var(--text-secondary);
+		}
+
+		.field-status {
+			font-size: 10px;
+			color: var(--text-secondary);
+			opacity: 0.8;
+		}
+
+		.settings-input {
+			width: 100%;
+			padding: 8px;
+			border-radius: 6px;
+			border: 1px solid var(--border);
+			background: rgba(29, 36, 48, 0.9);
+			color: var(--text-primary);
+			font-size: 12px;
+		}
+
+		.settings-input:focus {
+			outline: none;
+			border-color: rgba(244, 184, 96, 0.6);
+			box-shadow: 0 0 0 3px rgba(244, 184, 96, 0.12);
 		}
 
 	</style>
@@ -2837,7 +3009,16 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			</button>
 			<span class="topbar-title">Chat</span>
 			<div id="agentStatus" class="status-pill hidden">Agent: idle</div>
-			<button id="settingsButton" class="icon-btn" title="Settings">⚙</button>
+			<button id="profileButton" class="icon-btn" title="Profile">
+				<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+					<path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm0 2c-4.4 0-8 2.2-8 5v1h16v-1c0-2.8-3.6-5-8-5z"/>
+				</svg>
+			</button>
+			<button id="settingsButton" class="icon-btn" title="Settings">
+				<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+					<path d="M12 8.6a3.4 3.4 0 1 0 3.4 3.4A3.4 3.4 0 0 0 12 8.6zm9 3.4a7.1 7.1 0 0 0-.1-1.4l2-1.5-2-3.4-2.4 1a7.6 7.6 0 0 0-2.4-1.4l-.4-2.6H10l-.4 2.6a7.6 7.6 0 0 0-2.4 1.4l-2.4-1-2 3.4 2 1.5A7.1 7.1 0 0 0 3 12a7.1 7.1 0 0 0 .1 1.4l-2 1.5 2 3.4 2.4-1a7.6 7.6 0 0 0 2.4 1.4l.4 2.6h4l.4-2.6a7.6 7.6 0 0 0 2.4-1.4l2.4 1 2-3.4-2-1.5A7.1 7.1 0 0 0 21 12z"/>
+				</svg>
+			</button>
 		</div>
 		<div class="messages-container scrollbar-thin" id="messages"></div>
 		
@@ -2876,16 +3057,41 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 		<div id="settingsOverlay" class="confirm-overlay">
 			<div class="confirm-modal">
-				<div class="confirm-title">Groq Settings</div>
-				<div class="confirm-detail">
-					<div style="margin-bottom: 8px;">Select a Groq model or enter one manually.</div>
-					<select id="groqModelSelect" style="width: 100%; margin-bottom: 8px;"></select>
-					<input id="groqModelInput" type="text" placeholder="e.g. llama-3.3-70b-versatile" style="width: 100%; padding: 6px;" />
+				<div class="confirm-title">Settings</div>
+				<div class="confirm-detail settings-detail">
+					<div class="settings-section">
+						<div class="section-title">Groq Model</div>
+						<div class="settings-field">
+							<span class="field-label">Select a Groq model or enter one manually.</span>
+							<select id="groqModelSelect" class="settings-input"></select>
+							<input id="groqModelInput" class="settings-input" type="text" placeholder="e.g. llama-3.3-70b-versatile" autocomplete="off" />
+						</div>
+					</div>
+					<div class="settings-section">
+						<div class="section-title">Credentials</div>
+						<div class="settings-field">
+							<span class="field-label">GITHUB_TOKEN</span>
+							<input id="githubTokenInput" class="settings-input" type="password" placeholder="Paste GitHub token" autocomplete="off" />
+							<span id="githubTokenStatus" class="field-status">Not set</span>
+						</div>
+						<div class="settings-field">
+							<span class="field-label">GROQ_API_KEY</span>
+							<input id="groqApiKeyInput" class="settings-input" type="password" placeholder="Paste Groq API key" autocomplete="off" />
+							<span id="groqApiKeyStatus" class="field-status">Not set</span>
+						</div>
+						<div class="settings-field">
+							<span class="field-label">GITHUB_OWNER_NAME</span>
+							<input id="githubOwnerInput" class="settings-input" type="text" placeholder="e.g. AyushKaithwas978" autocomplete="off" />
+							<span id="githubOwnerStatus" class="field-status">Not set</span>
+						</div>
+					</div>
 				</div>
 				<div class="confirm-actions">
 					<button id="groqRefresh" class="confirm-btn">Refresh</button>
 					<button id="groqTest" class="confirm-btn">Test</button>
-					<button id="groqSave" class="confirm-btn">Save</button>
+					<button id="groqSave" class="confirm-btn">Save Groq</button>
+					<button id="credSave" class="confirm-btn">Save Creds</button>
+					<button id="credClear" class="confirm-btn">Clear Creds</button>
 				</div>
 			</div>
 		</div>
