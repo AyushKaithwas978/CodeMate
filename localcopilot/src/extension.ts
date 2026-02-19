@@ -2267,6 +2267,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 		.messages-container {
 			flex: 1;
+			min-width: 0;
 			overflow-y: auto;
 			padding: 20px 18px 28px;
 			display: flex;
@@ -2278,6 +2279,7 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			display: flex;
 			flex-direction: column;
 			gap: 8px;
+			min-width: 0;
 			animation: rise 0.35s ease both;
 		}
 
@@ -2309,11 +2311,19 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			box-shadow: var(--glow);
 			line-height: 1.6;
 			font-size: 13px;
+			max-width: 100%;
+			overflow-wrap: anywhere;
+			word-break: break-word;
 		}
 
 		.message.user .message-content {
 			background: linear-gradient(135deg, rgba(244, 184, 96, 0.12), rgba(95, 180, 168, 0.1));
 			border-color: rgba(244, 184, 96, 0.25);
+		}
+
+		.message-content code {
+			word-break: break-word;
+			overflow-wrap: anywhere;
 		}
 
 		.file-context {
