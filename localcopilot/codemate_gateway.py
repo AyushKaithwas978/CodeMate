@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -111,74 +112,81 @@ class Store:
           score REAL NOT NULL, created_at REAL NOT NULL
         );
         """
-        with self._conn() as c:
+        with closing(self._conn()) as c:
             c.executescript(ddl)
             c.commit()
 
     def create_task(self, req: TaskCreateRequest) -> str:
         now = time.time()
         task_id = f"task_{uuid.uuid4().hex[:12]}"
-        with self._lock, self._conn() as c:
-            c.execute(
-                """INSERT INTO tasks(id,goal,status,context_json,current_step_id,error,created_at,updated_at,max_steps,time_budget_sec,token_budget)
-                VALUES(?,?,?,?,NULL,NULL,?,?,?,?,?)""",
-                (task_id, req.goal.strip(), "queued", json.dumps(req.context or {}), now, now, req.max_steps, req.time_budget_sec, req.token_budget),
-            )
-            c.commit()
+        with self._lock:
+            with closing(self._conn()) as c:
+                c.execute(
+                    """INSERT INTO tasks(id,goal,status,context_json,current_step_id,error,created_at,updated_at,max_steps,time_budget_sec,token_budget)
+                    VALUES(?,?,?,?,NULL,NULL,?,?,?,?,?)""",
+                    (task_id, req.goal.strip(), "queued", json.dumps(req.context or {}), now, now, req.max_steps, req.time_budget_sec, req.token_budget),
+                )
+                c.commit()
         return task_id
 
     def add_steps(self, task_id: str, steps: List[Dict[str, Any]]) -> None:
         now = time.time()
-        with self._lock, self._conn() as c:
-            for s in steps:
-                c.execute(
-                    """INSERT INTO task_steps(id,task_id,step_index,role,action,tool_name,risk_level,idempotent,status,input_json,output_json,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
-                    (s["id"], task_id, s["step_index"], s["role"], s["action"], s["tool_name"], s["risk_level"], 1 if s.get("idempotent", True) else 0, "pending", json.dumps(s.get("input", {})), now, now),
-                )
-            c.commit()
+        with self._lock:
+            with closing(self._conn()) as c:
+                for s in steps:
+                    c.execute(
+                        """INSERT INTO task_steps(id,task_id,step_index,role,action,tool_name,risk_level,idempotent,status,input_json,output_json,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
+                        (s["id"], task_id, s["step_index"], s["role"], s["action"], s["tool_name"], s["risk_level"], 1 if s.get("idempotent", True) else 0, "pending", json.dumps(s.get("input", {})), now, now),
+                    )
+                c.commit()
 
     def set_task(self, task_id: str, status: str, current_step_id: Optional[str] = None, error: Optional[str] = None) -> None:
         if status not in TASK_STATES:
             raise ValueError(status)
-        with self._lock, self._conn() as c:
-            c.execute("UPDATE tasks SET status=?, current_step_id=?, error=?, updated_at=? WHERE id=?", (status, current_step_id, error, time.time(), task_id))
-            c.commit()
+        with self._lock:
+            with closing(self._conn()) as c:
+                c.execute("UPDATE tasks SET status=?, current_step_id=?, error=?, updated_at=? WHERE id=?", (status, current_step_id, error, time.time(), task_id))
+                c.commit()
 
     def set_step(self, step_id: str, status: str, output: Optional[Dict[str, Any]] = None) -> None:
-        with self._lock, self._conn() as c:
-            c.execute("UPDATE task_steps SET status=?, output_json=?, updated_at=? WHERE id=?", (status, json.dumps(output) if output is not None else None, time.time(), step_id))
-            c.commit()
+        with self._lock:
+            with closing(self._conn()) as c:
+                c.execute("UPDATE task_steps SET status=?, output_json=?, updated_at=? WHERE id=?", (status, json.dumps(output) if output is not None else None, time.time(), step_id))
+                c.commit()
 
     def event(self, task_id: str, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         now = time.time()
-        with self._lock, self._conn() as c:
-            cur = c.execute("INSERT INTO task_events(task_id,event_type,payload_json,created_at) VALUES(?,?,?,?)", (task_id, event_type, json.dumps(payload), now))
-            c.commit()
-            event_id = int(cur.lastrowid or 0)
+        with self._lock:
+            with closing(self._conn()) as c:
+                cur = c.execute("INSERT INTO task_events(task_id,event_type,payload_json,created_at) VALUES(?,?,?,?)", (task_id, event_type, json.dumps(payload), now))
+                c.commit()
+                event_id = int(cur.lastrowid or 0)
         return {"id": event_id, "task_id": task_id, "event_type": event_type, "payload": payload, "created_at": now}
 
     def tool_run(self, task_id: str, step_id: str, tool_name: str, args: Dict[str, Any], result: Dict[str, Any]) -> None:
-        with self._lock, self._conn() as c:
-            c.execute(
-                """INSERT INTO tool_runs(id,task_id,step_id,tool_name,args_json,result_json,duration_ms,created_at)
-                VALUES(?,?,?,?,?,?,?,?)""",
-                (f"run_{uuid.uuid4().hex[:12]}", task_id, step_id, tool_name, json.dumps(args), json.dumps(result), int(result.get("duration_ms", 0)), time.time()),
-            )
-            c.commit()
+        with self._lock:
+            with closing(self._conn()) as c:
+                c.execute(
+                    """INSERT INTO tool_runs(id,task_id,step_id,tool_name,args_json,result_json,duration_ms,created_at)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (f"run_{uuid.uuid4().hex[:12]}", task_id, step_id, tool_name, json.dumps(args), json.dumps(result), int(result.get("duration_ms", 0)), time.time()),
+                )
+                c.commit()
 
     def memory(self, task_id: str, key: str, value: str, score: float) -> None:
-        with self._lock, self._conn() as c:
-            c.execute("INSERT INTO memory_items(id,task_id,key,value,score,created_at) VALUES(?,?,?,?,?,?)", (f"mem_{uuid.uuid4().hex[:12]}", task_id, key, value, score, time.time()))
-            c.commit()
+        with self._lock:
+            with closing(self._conn()) as c:
+                c.execute("INSERT INTO memory_items(id,task_id,key,value,score,created_at) VALUES(?,?,?,?,?,?)", (f"mem_{uuid.uuid4().hex[:12]}", task_id, key, value, score, time.time()))
+                c.commit()
 
     def list_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
-        with self._conn() as c:
+        with closing(self._conn()) as c:
             rows = c.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT ?", (max(1, min(limit, 100)),)).fetchall()
         return [self._task_dict(r) for r in rows]
 
     def snapshot(self, task_id: str) -> Dict[str, Any]:
-        with self._conn() as c:
+        with closing(self._conn()) as c:
             t = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not t:
                 raise KeyError(task_id)
@@ -191,7 +199,7 @@ class Store:
         }
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
-        with self._conn() as c:
+        with closing(self._conn()) as c:
             t = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_dict(t) if t else None
 
