@@ -990,6 +990,22 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 		const resolvedRequest = this.resolveFollowUpRequest(content, session) ?? content;
 
+		// Repo bootstrap flow: create GitHub repo + clone
+		const repoIntent = this.getRepoBootstrapIntent(resolvedRequest);
+		if (repoIntent.wantsCreate || repoIntent.wantsClone) {
+			const assistantMessage: ChatMessage = {
+				id: this.generateId(),
+				role: 'assistant',
+				content: '',
+				timestamp: Date.now(),
+				thinking: 'Preparing repository setup...'
+			};
+			session.messages.push(assistantMessage);
+			this.postToWebview({ type: 'messageAdded', message: assistantMessage });
+			await this.runGithubRepoBootstrapFlowFromChat(assistantMessage, resolvedRequest, repoIntent);
+			return;
+		}
+
 		// Manager flow: file creation (with optional git actions)
 		if (this.isFileCreateRequest(resolvedRequest)) {
 			const assistantMessage: ChatMessage = {
@@ -1163,12 +1179,37 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		const wantsCommit = text.includes('commit');
 		const wantsPush = text.includes('push') || text.includes('publish');
 		const wantsAdd = /\badd\b/.test(text) || text.includes('stage') || text.includes('git add');
+		const wantsCreateRepo = /create|new|make/.test(text) && /(repo|repository)/.test(text);
+		const wantsClone = text.includes('clone');
 		const mentionsGitHost = /(github|git hub|githb|githu|githug|gitlab|bitbucket|repo|repository)/.test(text);
 		const mentionsGit = /\bgit\b/.test(text);
-		const wantsGitOps = wantsCommit || wantsPush || wantsReadme || wantsAdd;
+		const wantsGitOps = wantsCommit || wantsPush || wantsReadme || wantsAdd || wantsCreateRepo || wantsClone;
 		if (!wantsGitOps) return false;
 		if (wantsReadme) return true;
-		return mentionsGitHost || mentionsGit || wantsCommit || wantsPush;
+		return mentionsGitHost || mentionsGit || wantsCommit || wantsPush || wantsCreateRepo || wantsClone;
+	}
+
+	private getRepoBootstrapIntent(content: string): { wantsCreate: boolean; wantsClone: boolean } {
+		const text = content.toLowerCase();
+		const wantsCreate = /(create|new|make)\s+(a\s+)?(github\s+)?(repo|repository)/.test(text);
+		const wantsClone = /\bclone\b/.test(text);
+		return { wantsCreate, wantsClone };
+	}
+
+	private extractRepoName(content: string): string | null {
+		const patterns = [
+			/(?:repo|repository)\s+name\s+(?:should be|is|=|:)?\s*([a-zA-Z0-9_.-]+)/i,
+			/(?:repo|repository)\s+named\s+([a-zA-Z0-9_.-]+)/i,
+			/\bnamed\s+([a-zA-Z0-9_.-]+)/i,
+			/\bcalled\s+([a-zA-Z0-9_.-]+)/i
+		];
+		for (const pattern of patterns) {
+			const match = content.match(pattern);
+			if (match && match[1]) {
+				return match[1].trim();
+			}
+		}
+		return null;
 	}
 
 	private async runFileAndGitFlowFromChat(request: string, assistantMessage: ChatMessage): Promise<void> {
@@ -1778,6 +1819,118 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			assistantMessage.content = `GitHub manager flow error: ${String(error)}`;
 			assistantMessage.thinking = undefined;
 			this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+		}
+	}
+
+	private async runGithubRepoBootstrapFlowFromChat(
+		assistantMessage: ChatMessage,
+		request: string,
+		intent: { wantsCreate: boolean; wantsClone: boolean }
+	): Promise<void> {
+		try {
+			const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+			if (!workspaceFolder) {
+				assistantMessage.content = 'No workspace folder found. Open the target folder first.';
+				assistantMessage.thinking = undefined;
+				this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+				return;
+			}
+			const repoNameRaw = this.extractRepoName(request);
+			if (!repoNameRaw) {
+				assistantMessage.content = 'Could not determine repo name. Use: "repo name should be <name>".';
+				assistantMessage.thinking = undefined;
+				this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+				return;
+			}
+			let repoName = repoNameRaw.trim();
+			const baseDir = workspaceFolder.uri.fsPath;
+			const targetDir = path.join(baseDir, repoName);
+			const fs = require('fs');
+			if (fs.existsSync(targetDir)) {
+				assistantMessage.content = `Target folder already exists: ${targetDir}`;
+				assistantMessage.thinking = undefined;
+				this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+				return;
+			}
+
+			const ownerName = await this.loadGithubOwnerName();
+			const wantsCreate = intent.wantsCreate;
+			const wantsClone = intent.wantsClone || intent.wantsCreate;
+			const confirm = await this.requestSidebarConfirm(
+				`Create GitHub repo "${repoName}" and clone to ${targetDir}?`,
+				`Owner: ${ownerName || 'from token'}\nActions: ${wantsCreate ? 'create repo' : 'skip create'} + ${wantsClone ? 'clone' : 'skip clone'}`,
+				['Yes', 'Cancel']
+			);
+			if (confirm !== 'Yes') {
+				assistantMessage.content = 'Cancelled.';
+				assistantMessage.thinking = undefined;
+				this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+				return;
+			}
+
+			let owner = ownerName;
+			if (wantsCreate) {
+				const createRes = await this.callMcpTool('github_create_repo', {
+					name: repoName,
+					private: false,
+					dry_run: false,
+					description: 'Repository created via CodeMate'
+				});
+				if (!createRes?.ok) {
+					assistantMessage.content = `GitHub repo creation failed. ${createRes?.error || createRes?.message || ''}`.trim();
+					assistantMessage.thinking = undefined;
+					this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+					return;
+				}
+				const full = createRes?.data?.full_name;
+				if (typeof full === 'string' && full.includes('/')) {
+					const parts = full.split('/');
+					owner = parts[0];
+					repoName = parts[1] || repoName;
+				}
+			}
+
+			if (!owner) {
+				assistantMessage.content = 'Missing GitHub owner. Set GITHUB_OWNER_NAME in Settings or add a remote.';
+				assistantMessage.thinking = undefined;
+				this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+				return;
+			}
+
+			if (wantsClone) {
+				const repoUrl = `https://github.com/${owner}/${repoName}.git`;
+				const cloneOk = await this.gitClone(repoUrl, targetDir);
+				if (!cloneOk.ok) {
+					assistantMessage.content = `Clone failed: ${cloneOk.error || 'Unknown error'}`;
+					assistantMessage.thinking = undefined;
+					this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+					return;
+				}
+			}
+
+			assistantMessage.content = `Done. Repo ${owner}/${repoName} ${wantsCreate ? 'created' : 'ready'} and cloned to ${targetDir}.`;
+			assistantMessage.thinking = undefined;
+			this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+		} catch (error) {
+			assistantMessage.content = `Repo setup error: ${String(error)}`;
+			assistantMessage.thinking = undefined;
+			this.postToWebview({ type: 'messageUpdated', message: assistantMessage });
+		}
+	}
+
+	private async gitClone(repoUrl: string, targetDir: string): Promise<{ ok: boolean; error?: string }> {
+		try {
+			const { exec } = await import('child_process');
+			return await new Promise((resolve) => {
+				exec(`git clone "${repoUrl}" "${targetDir}"`, (err, stdout, stderr) => {
+					if (err) {
+						return resolve({ ok: false, error: stderr?.toString().trim() || stdout?.toString().trim() || String(err) });
+					}
+					resolve({ ok: true });
+				});
+			});
+		} catch (error) {
+			return { ok: false, error: String(error) };
 		}
 	}
 
