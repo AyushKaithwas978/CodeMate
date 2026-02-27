@@ -696,6 +696,7 @@
 		const messageEl = document.createElement('div');
 		messageEl.className = `message ${message.role}`;
 		messageEl.dataset.id = message.id;
+		messageEl.dataset.copy = message.thinking ? String(message.thinking) : String(message.content || '');
 
 		// Message header
 		const header = document.createElement('div');
@@ -719,6 +720,8 @@
 			`;
 			header.appendChild(fileChip);
 		}
+
+		header.appendChild(createCopyButton(messageEl));
 
 		messageEl.appendChild(header);
 
@@ -757,6 +760,7 @@
 	function updateMessageElement(message) {
 		const messageEl = document.querySelector(`[data-id="${message.id}"]`);
 		if (!messageEl) return;
+		messageEl.dataset.copy = message.thinking ? String(message.thinking) : String(message.content || '');
 
 		const contentEl = messageEl.querySelector('.message-content');
 		
@@ -804,6 +808,43 @@
 			.replace(/\n/g, '<br>');
 
 		return formatted;
+	}
+
+	function createCopyButton(messageEl) {
+		const btn = document.createElement('button');
+		btn.className = 'copy-btn';
+		btn.type = 'button';
+		btn.title = 'Copy message';
+		btn.innerHTML = `
+			<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+				<path d="M16 1H6a2 2 0 0 0-2 2v12h2V3h10z"/>
+				<path d="M18 5H10a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H10V7h8z"/>
+			</svg>
+		`;
+		btn.addEventListener('click', async () => {
+			const text = messageEl?.dataset?.copy || '';
+			if (!text) return;
+			try {
+				await navigator.clipboard.writeText(text);
+			} catch {
+				const textarea = document.createElement('textarea');
+				textarea.value = text;
+				textarea.style.position = 'fixed';
+				textarea.style.opacity = '0';
+				document.body.appendChild(textarea);
+				textarea.focus();
+				textarea.select();
+				try {
+					document.execCommand('copy');
+				} catch {
+					// ignore
+				}
+				document.body.removeChild(textarea);
+			}
+			btn.classList.add('copied');
+			setTimeout(() => btn.classList.remove('copied'), 900);
+		});
+		return btn;
 	}
 
 	function createCodeBlock(change, messageId, changeIndex) {

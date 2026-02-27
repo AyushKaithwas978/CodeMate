@@ -2947,6 +2947,37 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			overflow-wrap: anywhere;
 		}
 
+		.copy-btn {
+			margin-left: auto;
+			width: 24px;
+			height: 24px;
+			border-radius: 6px;
+			border: 1px solid var(--border);
+			background: rgba(29, 36, 48, 0.7);
+			color: var(--text-secondary);
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			cursor: pointer;
+			transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
+		}
+
+		.copy-btn:hover {
+			border-color: rgba(244, 184, 96, 0.6);
+			background: rgba(244, 184, 96, 0.15);
+			color: var(--accent-hover);
+		}
+
+		.copy-btn.copied {
+			border-color: var(--success);
+			color: var(--success);
+		}
+
+		.copy-btn svg {
+			width: 14px;
+			height: 14px;
+		}
+
 		.file-context {
 			display: inline-flex;
 			align-items: center;
