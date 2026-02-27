@@ -33,6 +33,42 @@ interface ChatSession {
 	updatedAt: number;
 }
 
+interface AutonomyTask {
+	id: string;
+	goal: string;
+	status: 'queued' | 'planning' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'cancelled';
+	current_step_id?: string | null;
+	error?: string | null;
+	created_at?: number;
+	updated_at?: number;
+}
+
+interface AutonomyStep {
+	id: string;
+	step_index: number;
+	role: string;
+	action: string;
+	tool_name: string;
+	risk_level: 'low' | 'medium' | 'high';
+	status: string;
+	input?: Record<string, unknown>;
+	output?: Record<string, unknown> | null;
+}
+
+interface AutonomyEvent {
+	id?: number;
+	task_id?: string;
+	event_type: string;
+	payload?: Record<string, unknown>;
+	created_at?: number;
+}
+
+interface AutonomySnapshot {
+	task: AutonomyTask;
+	steps: AutonomyStep[];
+	events: AutonomyEvent[];
+}
+
 export function activate(context: vscode.ExtensionContext) {
 	const output = vscode.window.createOutputChannel('CodeMate');
 	context.subscriptions.push(output);
@@ -183,6 +219,11 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 	private pendingConfirms = new Map<string, (choice: string | null) => void>();
 	private agentServiceProcess: import('child_process').ChildProcess | undefined;
 	private agentServiceStarting: Promise<boolean> | null = null;
+	private gatewayProcess: import('child_process').ChildProcess | undefined;
+	private gatewayStarting: Promise<boolean> | null = null;
+	private gatewayStreams = new Map<string, AbortController>();
+	private readonly gatewayHost = '127.0.0.1';
+	private readonly autonomyTaskStorageKey = 'codemate.autonomy.activeTask';
 
 	private resolvePythonCommand(): { cmd: string; args: string[] } {
 		const configured = vscode.workspace.getConfiguration('codemate').get<string>('pythonPath');
@@ -346,6 +387,266 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 		return null;
 	}
 
+	private isAutonomyEnabled(): boolean {
+		return vscode.workspace.getConfiguration('codemate').get<boolean>('autonomy.enabled', false);
+	}
+
+	private getGatewayPort(): number {
+		const configured = vscode.workspace.getConfiguration('codemate').get<number>('autonomy.gatewayPort', 7011);
+		if (!configured || Number.isNaN(configured)) return 7011;
+		return Math.min(65535, Math.max(1024, Math.floor(configured)));
+	}
+
+	private getAutonomyMaxSteps(): number {
+		const configured = vscode.workspace.getConfiguration('codemate').get<number>('autonomy.maxPlanSteps', 8);
+		if (!configured || Number.isNaN(configured)) return 8;
+		return Math.min(30, Math.max(2, Math.floor(configured)));
+	}
+
+	private resolveGatewayPath(): string | null {
+		const fs = require('fs');
+		const candidates: string[] = [];
+		const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (workspaceRoot) candidates.push(path.join(workspaceRoot, 'codemate_gateway.py'));
+		candidates.push(path.join(this.context.extensionPath, 'codemate_gateway.py'));
+		candidates.push(path.resolve(this.context.extensionPath, '..', 'codemate_gateway.py'));
+		for (const candidate of candidates) {
+			try {
+				if (fs.existsSync(candidate)) return candidate;
+			} catch {
+				// ignore
+			}
+		}
+		return null;
+	}
+
+	private getGatewayDbPath(): string {
+		const fs = require('fs');
+		const dbDir = path.join(this.context.globalStorageUri.fsPath, 'autonomy');
+		try {
+			fs.mkdirSync(dbDir, { recursive: true });
+		} catch {
+			// ignore
+		}
+		return path.join(dbDir, 'codemate_gateway.db');
+	}
+
+	private gatewayBaseUrl(): string {
+		return `http://${this.gatewayHost}:${this.getGatewayPort()}`;
+	}
+
+	private async pingGateway(): Promise<boolean> {
+		try {
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 900);
+			const response = await fetch(`${this.gatewayBaseUrl()}/v1/health`, {
+				method: 'GET',
+				signal: controller.signal
+			});
+			clearTimeout(timeout);
+			return response.ok;
+		} catch {
+			return false;
+		}
+	}
+
+	private async ensureGatewayRunning(): Promise<boolean> {
+		if (await this.pingGateway()) return true;
+		if (this.gatewayStarting) return await this.gatewayStarting;
+		this.gatewayStarting = (async () => {
+			const gatewayPath = this.resolveGatewayPath();
+			if (!gatewayPath) {
+				this.output.appendLine('[Autonomy] codemate_gateway.py not found.');
+				return false;
+			}
+			try {
+				const { spawn } = await import('child_process');
+				const python = this.resolvePythonCommand();
+				const secretEnv = await this.buildSecretEnv();
+				const args = [
+					...python.args,
+					gatewayPath,
+					'--host', this.gatewayHost,
+					'--port', String(this.getGatewayPort()),
+					'--db', this.getGatewayDbPath()
+				];
+				this.output.appendLine(`[Autonomy] Starting gateway on ${this.gatewayBaseUrl()}...`);
+				const proc = spawn(python.cmd, args, {
+					cwd: path.dirname(gatewayPath),
+					stdio: ['ignore', 'pipe', 'pipe'],
+					env: { ...process.env, ...this.loadDotEnvVars(), ...secretEnv },
+					detached: true
+				});
+				this.gatewayProcess = proc;
+				proc.stdout.on('data', (d) => this.output.appendLine(`[Autonomy] ${String(d).trim()}`));
+				proc.stderr.on('data', (d) => this.output.appendLine(`[Autonomy] ${String(d).trim()}`));
+				proc.on('error', (e) => this.output.appendLine(`[Autonomy] spawn error: ${String(e)}`));
+				proc.unref();
+			} catch (err) {
+				this.output.appendLine(`[Autonomy] Failed to start gateway: ${String(err)}`);
+				return false;
+			}
+			for (let i = 0; i < 18; i++) {
+				if (await this.pingGateway()) return true;
+				await new Promise((r) => setTimeout(r, 300));
+			}
+			return false;
+		})();
+		try {
+			return await this.gatewayStarting;
+		} finally {
+			this.gatewayStarting = null;
+		}
+	}
+
+	private async gatewayRequest<T = any>(route: string, method: 'GET' | 'POST', body?: unknown): Promise<T> {
+		const ready = await this.ensureGatewayRunning();
+		if (!ready) throw new Error('Autonomy gateway unavailable');
+		const response = await fetch(`${this.gatewayBaseUrl()}${route}`, {
+			method,
+			headers: { 'Content-Type': 'application/json' },
+			body: body !== undefined ? JSON.stringify(body) : undefined
+		});
+		if (!response.ok) {
+			const raw = await response.text();
+			throw new Error(`Gateway ${method} ${route} failed (${response.status}): ${raw}`);
+		}
+		return await response.json() as T;
+	}
+
+	private async handleCreateTask(goal: string): Promise<void> {
+		const text = String(goal || '').trim();
+		if (!text) return;
+		const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+		const snapshot = await this.gatewayRequest<AutonomySnapshot>('/v1/tasks', 'POST', {
+			goal: text,
+			context: { repo_path: workspacePath, source: 'codemate_vscode' },
+			max_steps: this.getAutonomyMaxSteps(),
+			time_budget_sec: 300,
+			token_budget: 12000
+		});
+		void this.context.globalState.update(this.autonomyTaskStorageKey, snapshot.task.id);
+		this.postToWebview({ type: 'taskCreated', task: snapshot.task, steps: snapshot.steps, events: snapshot.events });
+		void this.startTaskEventStream(snapshot.task.id);
+	}
+
+	private async handleTaskSnapshot(taskId: string): Promise<void> {
+		const id = String(taskId || '').trim();
+		if (!id) return;
+		const snapshot = await this.gatewayRequest<AutonomySnapshot>(`/v1/tasks/${encodeURIComponent(id)}`, 'GET');
+		this.postToWebview({ type: 'taskUpdated', task: snapshot.task, steps: snapshot.steps, events: snapshot.events });
+		void this.startTaskEventStream(snapshot.task.id);
+	}
+
+	private async handleTaskApprove(taskId: string): Promise<void> {
+		const id = String(taskId || '').trim();
+		if (!id) return;
+		const snapshot = await this.gatewayRequest<AutonomySnapshot>(`/v1/tasks/${encodeURIComponent(id)}/approve`, 'POST', {});
+		this.postToWebview({ type: 'taskUpdated', task: snapshot.task, steps: snapshot.steps, events: snapshot.events });
+	}
+
+	private async handleTaskDeny(taskId: string, reason: string): Promise<void> {
+		const id = String(taskId || '').trim();
+		if (!id) return;
+		const snapshot = await this.gatewayRequest<AutonomySnapshot>(`/v1/tasks/${encodeURIComponent(id)}/deny`, 'POST', {
+			reason: String(reason || 'Denied by user')
+		});
+		this.postToWebview({ type: 'taskFailed', task: snapshot.task, steps: snapshot.steps, events: snapshot.events });
+	}
+
+	private async handleTaskCancel(taskId: string): Promise<void> {
+		const id = String(taskId || '').trim();
+		if (!id) return;
+		const snapshot = await this.gatewayRequest<AutonomySnapshot>(`/v1/tasks/${encodeURIComponent(id)}/cancel`, 'POST', {});
+		this.postToWebview({ type: 'taskUpdated', task: snapshot.task, steps: snapshot.steps, events: snapshot.events });
+	}
+
+	private async sendRecentTasks(): Promise<void> {
+		try {
+			const result = await this.gatewayRequest<{ tasks: AutonomyTask[] }>('/v1/tasks?limit=20', 'GET');
+			this.postToWebview({ type: 'tasksLoaded', tasks: result.tasks || [] });
+			const activeTask = this.context.globalState.get<string>(this.autonomyTaskStorageKey) || '';
+			if (activeTask) {
+				await this.handleTaskSnapshot(activeTask);
+			} else if (result.tasks && result.tasks.length > 0) {
+				const latest = result.tasks[0];
+				void this.context.globalState.update(this.autonomyTaskStorageKey, latest.id);
+				await this.handleTaskSnapshot(latest.id);
+			}
+		} catch (err) {
+			this.output.appendLine(`[Autonomy] Failed to load tasks: ${String(err)}`);
+		}
+	}
+
+	private async startTaskEventStream(taskId: string): Promise<void> {
+		const id = String(taskId || '').trim();
+		if (!id || this.gatewayStreams.has(id)) return;
+		const controller = new AbortController();
+		this.gatewayStreams.set(id, controller);
+		try {
+			const ready = await this.ensureGatewayRunning();
+			if (!ready) return;
+			const response = await fetch(`${this.gatewayBaseUrl()}/v1/tasks/${encodeURIComponent(id)}/events`, {
+				method: 'GET',
+				headers: { Accept: 'text/event-stream' },
+				signal: controller.signal
+			});
+			if (!response.ok || !response.body) {
+				throw new Error(`SSE failed (${response.status})`);
+			}
+			const reader = response.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
+			while (true) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+				const parts = buffer.split('\n\n');
+				buffer = parts.pop() || '';
+				for (const part of parts) {
+					const line = part.split('\n').find((l) => l.startsWith('data:'));
+					if (!line) continue;
+					const raw = line.slice(5).trim();
+					if (!raw) continue;
+					try {
+						const evt = JSON.parse(raw) as AutonomyEvent;
+						this.handleTaskEvent(id, evt);
+					} catch {
+						// ignore malformed event
+					}
+				}
+			}
+		} catch (err) {
+			this.output.appendLine(`[Autonomy] SSE closed for ${id}: ${String(err)}`);
+		} finally {
+			this.gatewayStreams.delete(id);
+		}
+	}
+
+	private handleTaskEvent(taskId: string, evt: AutonomyEvent): void {
+		if (evt.event_type === 'snapshot' && evt.payload) {
+			const payload = evt.payload as unknown as AutonomySnapshot;
+			if (payload.task) {
+				this.postToWebview({ type: 'taskUpdated', task: payload.task, steps: payload.steps || [], events: payload.events || [] });
+			}
+			return;
+		}
+		switch (evt.event_type) {
+			case 'approval_requested':
+				this.postToWebview({ type: 'approvalRequested', taskId, event: evt });
+				break;
+			case 'task_completed':
+				this.postToWebview({ type: 'taskCompleted', taskId, event: evt });
+				break;
+			case 'task_failed':
+				this.postToWebview({ type: 'taskFailed', taskId, event: evt });
+				break;
+			default:
+				this.postToWebview({ type: 'taskEvent', taskId, event: evt });
+				break;
+		}
+	}
+
 	constructor(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
 		this.context = context;
 		this.output = output;
@@ -435,6 +736,45 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 					break;
 				case 'runGithubFlow':
 					await this.runGithubManagerFlow();
+					break;
+				case 'createTask':
+					if (!this.isAutonomyEnabled()) {
+						this.postToWebview({ type: 'taskError', message: 'Autonomy is disabled in settings.' });
+						break;
+					}
+					try {
+						await this.handleCreateTask(message.goal);
+					} catch (err) {
+						this.postToWebview({ type: 'taskError', message: String(err) });
+					}
+					break;
+				case 'approveTaskStep':
+					try {
+						await this.handleTaskApprove(message.taskId);
+					} catch (err) {
+						this.postToWebview({ type: 'taskError', message: String(err) });
+					}
+					break;
+				case 'denyTaskStep':
+					try {
+						await this.handleTaskDeny(message.taskId, message.reason || 'Denied by user');
+					} catch (err) {
+						this.postToWebview({ type: 'taskError', message: String(err) });
+					}
+					break;
+				case 'cancelTask':
+					try {
+						await this.handleTaskCancel(message.taskId);
+					} catch (err) {
+						this.postToWebview({ type: 'taskError', message: String(err) });
+					}
+					break;
+				case 'requestTaskSnapshot':
+					try {
+						await this.handleTaskSnapshot(message.taskId);
+					} catch (err) {
+						this.postToWebview({ type: 'taskError', message: String(err) });
+					}
 					break;
 				case 'confirmResult':
 					{
@@ -2192,6 +2532,15 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 				await this.sendGroqModelsToWebview();
 			}
 			await this.sendCredentialsStatus();
+			this.postToWebview({
+				type: 'autonomyConfig',
+				enabled: this.isAutonomyEnabled(),
+				port: this.getGatewayPort(),
+				maxSteps: this.getAutonomyMaxSteps()
+			});
+			if (this.isAutonomyEnabled()) {
+				await this.sendRecentTasks();
+			}
 
 			// Load sessions
 			this.ensureSessionsLoaded();
@@ -2844,6 +3193,84 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			background: rgba(244, 135, 113, 0.15);
 		}
 
+		.task-panel {
+			border-bottom: 1px solid var(--border);
+			padding: 10px 12px;
+			background: rgba(15, 18, 24, 0.92);
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+		}
+
+		.task-panel.hidden {
+			display: none;
+		}
+
+		.task-row {
+			display: flex;
+			gap: 8px;
+		}
+
+		.task-input {
+			flex: 1;
+			padding: 8px 10px;
+			border-radius: 6px;
+			border: 1px solid var(--border);
+			background: rgba(29, 36, 48, 0.9);
+			color: var(--text-primary);
+			font-size: 12px;
+		}
+
+		.task-input:focus {
+			outline: none;
+			border-color: rgba(95, 180, 168, 0.7);
+			box-shadow: 0 0 0 2px rgba(95, 180, 168, 0.18);
+		}
+
+		.task-btn {
+			padding: 0 10px;
+			border: 1px solid var(--border);
+			border-radius: 6px;
+			background: rgba(29, 36, 48, 0.9);
+			color: var(--text-primary);
+			font-size: 12px;
+			cursor: pointer;
+		}
+
+		.task-btn:hover {
+			border-color: rgba(244, 184, 96, 0.6);
+			background: rgba(244, 184, 96, 0.15);
+		}
+
+		.task-meta {
+			font-size: 11px;
+			color: var(--text-secondary);
+		}
+
+		.task-controls {
+			display: flex;
+			gap: 6px;
+		}
+
+		.task-timeline {
+			max-height: 156px;
+			overflow-y: auto;
+			border: 1px solid var(--border);
+			border-radius: 6px;
+			background: rgba(21, 26, 34, 0.8);
+			padding: 6px;
+			display: flex;
+			flex-direction: column;
+			gap: 6px;
+		}
+
+		.task-event {
+			font-size: 11px;
+			color: var(--text-secondary);
+			border-left: 2px solid rgba(95, 180, 168, 0.7);
+			padding-left: 8px;
+		}
+
 		.icon-btn {
 			width: 28px;
 			height: 28px;
@@ -2941,6 +3368,39 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			white-space: normal;
 		}
 
+		.settings-modal-header {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 8px;
+			margin-bottom: 8px;
+		}
+
+		.settings-modal-header .confirm-title {
+			margin-bottom: 0;
+		}
+
+		.settings-close-btn {
+			width: 28px;
+			height: 28px;
+			border: 1px solid var(--border);
+			border-radius: 6px;
+			background: rgba(29, 36, 48, 0.8);
+			color: var(--text-primary);
+			font-size: 18px;
+			line-height: 1;
+			cursor: pointer;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			padding: 0;
+		}
+
+		.settings-close-btn:hover {
+			border-color: rgba(244, 184, 96, 0.6);
+			background: rgba(244, 184, 96, 0.15);
+		}
+
 		.settings-section {
 			display: flex;
 			flex-direction: column;
@@ -3009,16 +3469,24 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 			</button>
 			<span class="topbar-title">Chat</span>
 			<div id="agentStatus" class="status-pill hidden">Agent: idle</div>
-			<button id="profileButton" class="icon-btn" title="Profile">
-				<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-					<path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm0 2c-4.4 0-8 2.2-8 5v1h16v-1c0-2.8-3.6-5-8-5z"/>
-				</svg>
-			</button>
 			<button id="settingsButton" class="icon-btn" title="Settings">
 				<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
 					<path d="M12 8.6a3.4 3.4 0 1 0 3.4 3.4A3.4 3.4 0 0 0 12 8.6zm9 3.4a7.1 7.1 0 0 0-.1-1.4l2-1.5-2-3.4-2.4 1a7.6 7.6 0 0 0-2.4-1.4l-.4-2.6H10l-.4 2.6a7.6 7.6 0 0 0-2.4 1.4l-2.4-1-2 3.4 2 1.5A7.1 7.1 0 0 0 3 12a7.1 7.1 0 0 0 .1 1.4l-2 1.5 2 3.4 2.4-1a7.6 7.6 0 0 0 2.4 1.4l.4 2.6h4l.4-2.6a7.6 7.6 0 0 0 2.4-1.4l2.4 1 2-3.4-2-1.5A7.1 7.1 0 0 0 21 12z"/>
 				</svg>
 			</button>
+		</div>
+		<div id="taskPanel" class="task-panel hidden">
+			<div class="task-row">
+				<input id="taskGoalInput" class="task-input" type="text" placeholder="Autonomy goal: plan and run multi-step task..." />
+				<button id="createTaskBtn" class="task-btn">Run</button>
+			</div>
+			<div id="taskMeta" class="task-meta">Autonomy disabled</div>
+			<div class="task-controls">
+				<button id="taskApproveBtn" class="task-btn">Approve</button>
+				<button id="taskDenyBtn" class="task-btn">Deny</button>
+				<button id="taskCancelBtn" class="task-btn">Cancel</button>
+			</div>
+			<div id="taskTimeline" class="task-timeline scrollbar-thin"></div>
 		</div>
 		<div class="messages-container scrollbar-thin" id="messages"></div>
 		
@@ -3057,7 +3525,10 @@ class ModernAgentSidebarProvider implements vscode.WebviewViewProvider {
 
 		<div id="settingsOverlay" class="confirm-overlay">
 			<div class="confirm-modal">
-				<div class="confirm-title">Settings</div>
+				<div class="settings-modal-header">
+					<div class="confirm-title">Settings</div>
+					<button id="settingsClose" class="settings-close-btn" title="Close settings" aria-label="Close settings">&times;</button>
+				</div>
 				<div class="confirm-detail settings-detail">
 					<div class="settings-section">
 						<div class="section-title">Groq Model</div>

@@ -41,6 +41,25 @@
                                                                                                   "type":  "string",
                                                                                                   "default":  "",
                                                                                                   "description":  "Optional Python command for MCP/agents (e.g. \"py -3\" or full path). If empty, uses py -3 on Windows, python3 on Unix."
+                                                                                              },
+                                                                 "codemate.autonomy.enabled":  {
+                                                                                                  "type":  "boolean",
+                                                                                                  "default":  false,
+                                                                                                  "description":  "Enable CodeMate autonomous task runner (beta)."
+                                                                                              },
+                                                                 "codemate.autonomy.gatewayPort":  {
+                                                                                                  "type":  "number",
+                                                                                                  "default":  7011,
+                                                                                                  "minimum":  1024,
+                                                                                                  "maximum":  65535,
+                                                                                                  "description":  "Local port for the CodeMate autonomy gateway."
+                                                                                              },
+                                                                 "codemate.autonomy.maxPlanSteps":  {
+                                                                                                  "type":  "number",
+                                                                                                  "default":  8,
+                                                                                                  "minimum":  2,
+                                                                                                  "maximum":  30,
+                                                                                                  "description":  "Maximum number of planned steps per autonomous task."
                                                                                               }
                                                              }
                                           },

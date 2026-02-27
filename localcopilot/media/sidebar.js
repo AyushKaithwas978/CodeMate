@@ -22,8 +22,8 @@
 	const confirmTitle = document.getElementById('confirmTitle');
 	const confirmDetail = document.getElementById('confirmDetail');
 	const confirmButtons = document.getElementById('confirmButtons');
-	const profileBtn = document.getElementById('profileButton');
 	const settingsBtn = document.getElementById('settingsButton');
+	const settingsCloseBtn = document.getElementById('settingsClose');
 	const settingsOverlay = document.getElementById('settingsOverlay');
 	const groqModelSelect = document.getElementById('groqModelSelect');
 	const groqModelInput = document.getElementById('groqModelInput');
@@ -38,13 +38,27 @@
 	const githubOwnerStatus = document.getElementById('githubOwnerStatus');
 	const credSaveBtn = document.getElementById('credSave');
 	const credClearBtn = document.getElementById('credClear');
+	const taskPanel = document.getElementById('taskPanel');
+	const taskGoalInput = document.getElementById('taskGoalInput');
+	const createTaskBtn = document.getElementById('createTaskBtn');
+	const taskMeta = document.getElementById('taskMeta');
+	const taskApproveBtn = document.getElementById('taskApproveBtn');
+	const taskDenyBtn = document.getElementById('taskDenyBtn');
+	const taskCancelBtn = document.getElementById('taskCancelBtn');
+	const taskTimeline = document.getElementById('taskTimeline');
 	let availableModels = [];
 	let currentModel = '';
+	let autonomyEnabled = false;
+	let activeTaskId = null;
+	let activeTaskStatus = '';
+	let taskEvents = [];
 
 	// Initialize
 	window.addEventListener('DOMContentLoaded', () => {
 		setupEventListeners();
 		loadSidebarState();
+		updateTaskControls();
+		renderTaskTimeline();
 		vscode.postMessage({ type: 'init' });
 	});
 
@@ -69,6 +83,7 @@
 		input.addEventListener('input', () => {
 			input.style.height = 'auto';
 			input.style.height = input.scrollHeight + 'px';
+			saveDraftInput();
 		});
 
 		// New chat
@@ -90,9 +105,9 @@
 			});
 		}
 
-		if (profileBtn) {
-			profileBtn.addEventListener('click', () => {
-				openSettings();
+		if (settingsCloseBtn) {
+			settingsCloseBtn.addEventListener('click', () => {
+				closeSettings();
 			});
 		}
 
@@ -144,6 +159,46 @@
 			});
 		}
 
+		if (createTaskBtn) {
+			createTaskBtn.addEventListener('click', () => {
+				const goal = (taskGoalInput?.value || '').trim();
+				if (!goal) return;
+				vscode.postMessage({ type: 'createTask', goal });
+				if (taskGoalInput) taskGoalInput.value = '';
+			});
+		}
+
+		if (taskGoalInput) {
+			taskGoalInput.addEventListener('keydown', (e) => {
+				if (e.key === 'Enter') {
+					e.preventDefault();
+					createTaskBtn?.click();
+				}
+			});
+		}
+
+		if (taskApproveBtn) {
+			taskApproveBtn.addEventListener('click', () => {
+				if (!activeTaskId) return;
+				vscode.postMessage({ type: 'approveTaskStep', taskId: activeTaskId });
+			});
+		}
+
+		if (taskDenyBtn) {
+			taskDenyBtn.addEventListener('click', () => {
+				if (!activeTaskId) return;
+				const reason = window.prompt('Reason for denial:', 'Denied by user') || 'Denied by user';
+				vscode.postMessage({ type: 'denyTaskStep', taskId: activeTaskId, reason });
+			});
+		}
+
+		if (taskCancelBtn) {
+			taskCancelBtn.addEventListener('click', () => {
+				if (!activeTaskId) return;
+				vscode.postMessage({ type: 'cancelTask', taskId: activeTaskId });
+			});
+		}
+
 		// Model selection
 		if (modelButton) {
 			modelButton.addEventListener('click', (e) => {
@@ -172,11 +227,29 @@
 		const defaultCollapsed = document.body.classList.contains('sidebar-collapsed');
 		sidebarCollapsed = typeof state.sidebarCollapsed === 'boolean' ? state.sidebarCollapsed : defaultCollapsed;
 		document.body.classList.toggle('sidebar-collapsed', sidebarCollapsed);
+		if (typeof state.draftInput === 'string') {
+			input.value = state.draftInput;
+			input.style.height = 'auto';
+			if (state.draftInput) {
+				input.style.height = input.scrollHeight + 'px';
+			}
+		}
+		if (typeof state.activeTaskId === 'string' && state.activeTaskId.trim()) {
+			activeTaskId = state.activeTaskId.trim();
+			vscode.postMessage({ type: 'requestTaskSnapshot', taskId: activeTaskId });
+		}
 	}
 
 	function saveSidebarState() {
 		const state = vscode.getState() || {};
 		state.sidebarCollapsed = sidebarCollapsed;
+		state.activeTaskId = activeTaskId || '';
+		vscode.setState(state);
+	}
+
+	function saveDraftInput() {
+		const state = vscode.getState() || {};
+		state.draftInput = input.value;
 		vscode.setState(state);
 	}
 
@@ -191,6 +264,7 @@
 
 		input.value = '';
 		input.style.height = 'auto';
+		saveDraftInput();
 	}
 
 	// Handle messages from extension
@@ -263,6 +337,39 @@
 			case 'credentialsStatus':
 				updateCredentialStatus(message.status || {});
 				break;
+			case 'autonomyConfig':
+				handleAutonomyConfig(message);
+				break;
+			case 'tasksLoaded':
+				handleTasksLoaded(message.tasks || []);
+				break;
+			case 'taskCreated':
+				handleTaskSnapshot(message, true);
+				break;
+			case 'taskUpdated':
+				handleTaskSnapshot(message, false);
+				break;
+			case 'taskEvent':
+				appendTaskEvent(message.event);
+				break;
+			case 'approvalRequested':
+				appendTaskEvent(message.event);
+				activeTaskStatus = 'waiting_approval';
+				updateTaskControls();
+				break;
+			case 'taskCompleted':
+				appendTaskEvent(message.event);
+				activeTaskStatus = 'completed';
+				updateTaskControls();
+				break;
+			case 'taskFailed':
+				appendTaskEvent(message.event);
+				activeTaskStatus = 'failed';
+				updateTaskControls();
+				break;
+			case 'taskError':
+				if (taskMeta) taskMeta.textContent = message.message || 'Autonomy error';
+				break;
 		}
 	});
 
@@ -328,6 +435,117 @@
 		setStatus(githubTokenStatus, !!status.githubToken);
 		setStatus(groqApiKeyStatus, !!status.groqApiKey);
 		setStatus(githubOwnerStatus, !!status.githubOwnerName);
+	}
+
+	function handleAutonomyConfig(message) {
+		autonomyEnabled = !!message.enabled;
+		if (taskPanel) {
+			taskPanel.classList.toggle('hidden', !autonomyEnabled);
+		}
+		if (!autonomyEnabled) {
+			activeTaskId = null;
+			activeTaskStatus = '';
+			taskEvents = [];
+			renderTaskTimeline();
+		}
+		if (taskMeta) {
+			taskMeta.textContent = autonomyEnabled
+				? `Autonomy enabled on port ${message.port || ''}`.trim()
+				: 'Autonomy disabled (enable codemate.autonomy.enabled)';
+		}
+		updateTaskControls();
+	}
+
+	function handleTasksLoaded(tasks) {
+		if (!Array.isArray(tasks) || tasks.length === 0) return;
+		if (!activeTaskId) {
+			activeTaskId = tasks[0].id || null;
+			saveSidebarState();
+			if (activeTaskId) {
+				vscode.postMessage({ type: 'requestTaskSnapshot', taskId: activeTaskId });
+			}
+		}
+	}
+
+	function handleTaskSnapshot(message, isNewTask) {
+		const task = message.task || {};
+		const taskId = task.id || '';
+		if (!taskId) return;
+		activeTaskId = taskId;
+		activeTaskStatus = task.status || '';
+		saveSidebarState();
+		if (taskMeta) {
+			const errorSuffix = task.error ? ` | ${task.error}` : '';
+			taskMeta.textContent = `Task ${taskId}: ${activeTaskStatus || 'unknown'}${errorSuffix}`;
+		}
+		const events = Array.isArray(message.events) ? message.events : [];
+		if (events.length > 0) {
+			taskEvents = events;
+		}
+		if (isNewTask) {
+			taskEvents = [];
+		}
+		renderTaskTimeline();
+		updateTaskControls();
+	}
+
+	function appendTaskEvent(event) {
+		if (!event || typeof event !== 'object') return;
+		if (event.event_type === 'task_updated' && event.payload && typeof event.payload.status === 'string') {
+			activeTaskStatus = event.payload.status;
+			if (taskMeta && activeTaskId) {
+				taskMeta.textContent = `Task ${activeTaskId}: ${activeTaskStatus}`;
+			}
+		}
+		if (event.event_type === 'task_completed') {
+			activeTaskStatus = 'completed';
+		}
+		if (event.event_type === 'task_failed') {
+			activeTaskStatus = 'failed';
+		}
+		taskEvents.push(event);
+		if (taskEvents.length > 200) {
+			taskEvents = taskEvents.slice(-200);
+		}
+		renderTaskTimeline();
+		updateTaskControls();
+	}
+
+	function updateTaskControls() {
+		const hasTask = !!activeTaskId;
+		const waitingApproval = activeTaskStatus === 'waiting_approval';
+		const done = activeTaskStatus === 'completed' || activeTaskStatus === 'failed' || activeTaskStatus === 'cancelled';
+		if (taskApproveBtn) taskApproveBtn.disabled = !hasTask || !waitingApproval;
+		if (taskDenyBtn) taskDenyBtn.disabled = !hasTask || !waitingApproval;
+		if (taskCancelBtn) taskCancelBtn.disabled = !hasTask || done;
+	}
+
+	function renderTaskTimeline() {
+		if (!taskTimeline) return;
+		taskTimeline.innerHTML = '';
+		if (!taskEvents || taskEvents.length === 0) {
+			const empty = document.createElement('div');
+			empty.className = 'task-event';
+			empty.textContent = 'No task events yet';
+			taskTimeline.appendChild(empty);
+			return;
+		}
+		taskEvents.slice(-60).forEach((event) => {
+			const row = document.createElement('div');
+			row.className = 'task-event';
+			const label = event.event_type || 'event';
+			let detail = '';
+			if (event.payload && typeof event.payload === 'object') {
+				if (event.payload.step_action) detail = String(event.payload.step_action);
+				else if (event.payload.reason) detail = String(event.payload.reason);
+				else if (event.payload.status) detail = String(event.payload.status);
+				else if (event.payload.tool_name) detail = String(event.payload.tool_name);
+			}
+			const ts = event.created_at ? new Date(event.created_at * 1000).toLocaleTimeString() : '';
+			row.textContent = `${ts ? `[${ts}] ` : ''}${label}${detail ? `: ${detail}` : ''}`;
+			taskTimeline.appendChild(row);
+		});
+		taskTimeline.scrollTop = taskTimeline.scrollHeight;
 	}
 
 	function showConfirm(message) {
